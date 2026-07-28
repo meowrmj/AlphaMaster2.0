@@ -5,6 +5,7 @@ let dataRootDir = "";
 let selectedStrategyFile = null;
 let selectedStrategySymbol = null;
 let selectedBacktestDataFile = null;
+let evalMode = localStorage.getItem("alphamaster_eval_mode") || "cpu_batch";
 let chart = null;
 let chartSymbol = null;
 let chartZoom = { min: null, max: null };
@@ -27,6 +28,25 @@ let lastErrorPopupText = "";
 let lastErrorPopupAt = 0;
 
 const $ = (id) => document.getElementById(id);
+
+function getEvalMode() {
+  const select = $("evalModeSelect");
+  const value = select?.value || evalMode || "cpu_batch";
+  if (!["cpu_batch", "cuda_batch", "legacy_cpu"].includes(value)) return "cpu_batch";
+  return value;
+}
+
+function initEvalModeSelect() {
+  const select = $("evalModeSelect");
+  if (!select) return;
+  select.value = ["cpu_batch", "cuda_batch", "legacy_cpu"].includes(evalMode) ? evalMode : "cpu_batch";
+  evalMode = select.value;
+  localStorage.setItem("alphamaster_eval_mode", evalMode);
+  select.addEventListener("change", () => {
+    evalMode = getEvalMode();
+    localStorage.setItem("alphamaster_eval_mode", evalMode);
+  });
+}
 
 const CPU_TRAINING_NOTE = `暂无报错
 
@@ -1174,7 +1194,7 @@ async function startTraining() {
     const res = await fetchJSON("/api/training/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: false }),
+      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: false, eval_mode: getEvalMode() }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
     renderDataFileCard(res.data_file);
@@ -1199,7 +1219,7 @@ async function retrainFromScratch() {
     const res = await fetchJSON("/api/training/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: true }),
+      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: true, eval_mode: getEvalMode() }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
     renderDataFileCard(res.data_file);
@@ -2754,6 +2774,7 @@ async function init() {
   } catch (e) {
     await logClientError("初始化失败: " + e.message);
   }
+  initEvalModeSelect();
   $("browseBtn").addEventListener("click", browseDataFile);
   if ($("dataRootBrowseBtn")) $("dataRootBrowseBtn").addEventListener("click", browseDataRootDir);
   if ($("dataRootSaveBtn")) $("dataRootSaveBtn").addEventListener("click", saveDataRootDir);

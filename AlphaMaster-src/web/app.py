@@ -93,6 +93,7 @@ def _with_relative_strategy_file(info: dict[str, Any]) -> dict[str, Any]:
 class StartTrainingRequest(BaseModel):
     data_file: str
     from_scratch: bool = False
+    eval_mode: str = "cpu_batch"
 
 
 class ClientLogRequest(BaseModel):
@@ -1044,6 +1045,7 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
             timeframe=info["timeframe"],
             mode="ftmo",
             from_scratch=bool(req.from_scratch),
+            eval_mode=req.eval_mode,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
@@ -1054,6 +1056,7 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
         "job": job.to_dict(),
         "data_file": info,
         "from_scratch": bool(req.from_scratch),
+        "eval_mode": job.eval_mode,
     }
 
 

@@ -94,6 +94,7 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
     print(f"  Train steps: {ModelConfig.TRAIN_STEPS}")
     print(f"  Bars: {info['bars']}")
     print(f"  Mode: {'from_scratch' if from_scratch else 'resume'}")
+    print(f"  Eval device: {ModelConfig.DEVICE}  batch_eval={ModelConfig.GPU_BATCH_EVAL}")
     print(f"{'=' * 60}")
 
     try:

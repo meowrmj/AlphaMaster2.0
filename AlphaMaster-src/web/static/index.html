@@ -88,6 +88,16 @@
             <div class="data-file-empty">尚未选择数据文件</div>
           </div>
         </div>
+        <div class="launch-row">
+          <label class="rt-field rt-field-wide">
+            <span>评估加速模式</span>
+            <select id="evalModeSelect">
+              <option value="cpu_batch" selected>CPU batch（默认）</option>
+              <option value="cuda_batch">CUDA batch</option>
+              <option value="legacy_cpu">旧 CPU</option>
+            </select>
+          </label>
+        </div>
         <div class="launch-actions" role="group" aria-label="训练操作">
           <button class="btn btn-primary" id="startBtn" disabled>开始训练</button>
           <button class="btn btn-secondary" id="retrainBtn" disabled title="清除检查点，从头重新搜索（保留已有更优策略）">重新训练</button>

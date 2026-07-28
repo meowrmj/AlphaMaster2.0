@@ -21,6 +21,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+EVAL_MODES = {"cpu_batch", "cuda_batch", "legacy_cpu"}
+
+
+def _normalize_eval_mode(value: str | None) -> str:
+    mode = str(value or "cpu_batch").strip().lower()
+    return mode if mode in EVAL_MODES else "cpu_batch"
+
+
+def _apply_eval_mode_env(env: dict[str, str], eval_mode: str) -> None:
+    if eval_mode == "cuda_batch":
+        env["ALPHAMASTER_DEVICE"] = "cuda"
+        env["ALPHAMASTER_GPU_BATCH_EVAL"] = "1"
+        env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "0"
+    elif eval_mode == "legacy_cpu":
+        env["ALPHAMASTER_DEVICE"] = "cpu"
+        env["ALPHAMASTER_GPU_BATCH_EVAL"] = "0"
+        env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "0"
+    else:
+        env["ALPHAMASTER_DEVICE"] = "cpu"
+        env["ALPHAMASTER_GPU_BATCH_EVAL"] = "1"
+        env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "0"
+
 
 class JobState(str, Enum):
     IDLE = "idle"
@@ -36,6 +58,7 @@ class TrainingJob:
     symbol: str
     timeframe: str
     mode: str
+    eval_mode: str = "cpu_batch"
     state: JobState = JobState.RUNNING
     pid: int | None = None
     log_path: str = ""
@@ -50,6 +73,7 @@ class TrainingJob:
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "mode": self.mode,
+            "eval_mode": self.eval_mode,
             "state": self.state.value,
             "pid": self.pid,
             "log_path": self.log_path,
@@ -85,6 +109,7 @@ class TrainingManager:
         mode: str = "ftmo",
         *,
         from_scratch: bool = False,
+        eval_mode: str = "cpu_batch",
     ) -> TrainingJob:
         with self._lock:
             self._refresh_state()
@@ -118,6 +143,8 @@ class TrainingManager:
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
             env["LOGURU_COLORIZE"] = "0"
+            eval_mode = _normalize_eval_mode(eval_mode)
+            _apply_eval_mode_env(env, eval_mode)
 
             creationflags = 0
             if sys.platform == "win32":
@@ -137,6 +164,7 @@ class TrainingManager:
                 symbol=symbol,
                 timeframe=timeframe,
                 mode=mode,
+                eval_mode=eval_mode,
                 pid=self._proc.pid,
                 log_path=str(log_path.relative_to(PROJECT_ROOT)).replace("\\", "/"),
                 started_at=datetime.now(timezone.utc).isoformat(),
