@@ -26,6 +26,15 @@ class BatchEvalResult:
     oos_sortino: Tensor
 
 
+@dataclass(frozen=True)
+class BatchPipelineResult:
+    factors: Tensor
+    valid: Tensor
+    train_scores: Tensor
+    val_scores: Tensor
+    oos_sortino: Tensor
+
+
 class BatchStackVM:
     """Batch StackVM for the single-symbol path.
 
@@ -375,3 +384,40 @@ class BatchBacktestEvaluator:
             torch.minimum(torch.full_like(oos_sor, 1.2), 1.0 + oos_sor * 0.1),
         )
         return BatchEvalResult(train_score, base_val * mult, oos_sor)
+
+
+class BatchFormulaPipeline:
+    """Full single-symbol batch path: formulas -> factors -> scores."""
+
+    def __init__(self, cost_rate: float = 0.0003, periods_per_year: int = 6240):
+        self.vm = BatchStackVM()
+        self.bt = BatchBacktestEvaluator(cost_rate=cost_rate, periods_per_year=periods_per_year)
+
+    def evaluate_fold_batch(
+        self,
+        formulas: Tensor | list[list[int]],
+        feat_tensor: Tensor,
+        target_ret: Tensor,
+        train_start: int,
+        train_end: int,
+        val_start: int,
+        val_end: int,
+    ) -> BatchPipelineResult:
+        factors, valid = self.vm.execute_batch(formulas, feat_tensor)
+        scores = self.bt.evaluate_fold_batch(
+            factors,
+            target_ret,
+            train_start,
+            train_end,
+            val_start,
+            val_end,
+        )
+        train_scores = torch.where(valid, scores.train_scores, torch.full_like(scores.train_scores, -5.0))
+        val_scores = torch.where(valid, scores.val_scores, torch.full_like(scores.val_scores, -5.0))
+        return BatchPipelineResult(
+            factors=factors,
+            valid=valid,
+            train_scores=train_scores,
+            val_scores=val_scores,
+            oos_sortino=scores.oos_sortino,
+        )
