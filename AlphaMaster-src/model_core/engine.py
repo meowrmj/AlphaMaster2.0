@@ -271,6 +271,7 @@ class AlphaEngine:
 
         self.vm = StackVM()
         self.bt = MT5Backtest()
+        self._batch_pipeline = None
 
         from .vocab import FORMULA_VOCAB as _v
         self.sampler = ConstrainedSampler(
@@ -452,6 +453,109 @@ class AlphaEngine:
                     'error': f'{type(e).__name__}: {e}'}
 
     # ── IC computation ────────────────────────────────────────────────────────
+
+    def _get_batch_pipeline(self):
+        if self._batch_pipeline is None:
+            from .gpu_batch import BatchFormulaPipeline
+            self._batch_pipeline = BatchFormulaPipeline(
+                cost_rate=self.bt.cost_rate,
+                periods_per_year=self.bt.periods_per_year,
+            )
+        else:
+            self._batch_pipeline.bt.cost_rate = self.bt.cost_rate
+            self._batch_pipeline.bt.periods_per_year = self.bt.periods_per_year
+        return self._batch_pipeline
+
+    def _eval_formula_batch_tasks(
+        self,
+        formulas: list[list[int]],
+        feat: torch.Tensor,
+        t_ret: torch.Tensor,
+        folds: list[dict],
+        use_wf: bool,
+        factor_pool_snapshot: list,
+    ) -> list[dict]:
+        """Batch VM/backtest path with the same public result contract."""
+        if not use_wf:
+            raise RuntimeError("batch evaluator currently requires walk-forward folds")
+        try:
+            pipe = self._get_batch_pipeline()
+            with torch.no_grad():
+                factors, valid = pipe.vm.execute_batch(formulas, feat)
+
+            train_scores = torch.zeros(len(formulas), device=feat.device)
+            val_scores = torch.zeros(len(formulas), device=feat.device)
+            ic_by_formula = [[] for _ in formulas]
+
+            with torch.no_grad():
+                for fold in folds:
+                    scores = pipe.bt.evaluate_fold_batch(
+                        factors,
+                        t_ret,
+                        fold["train_start"], fold["train_end"],
+                        fold["val_start"], fold["val_end"],
+                    )
+                    for i in range(len(formulas)):
+                        if not bool(valid[i]):
+                            continue
+                        res = factors[i]
+                        ic_m, _ = AlphaEngine._compute_ic(
+                            res[:, fold["train_start"]:fold["train_end"]],
+                            t_ret[:, fold["train_start"]:fold["train_end"]],
+                        )
+                        ic_v, _ = AlphaEngine._compute_ic(
+                            res[:, fold["val_start"]:fold["val_end"]],
+                            t_ret[:, fold["val_start"]:fold["val_end"]],
+                        )
+                        train_scores[i] += ModelConfig.REWARD_ALPHA * AlphaEngine._apply_ic_gate(
+                            scores.train_scores[i], ic_m
+                        )
+                        val_scores[i] += AlphaEngine._apply_ic_gate(scores.val_scores[i], ic_v)
+                        ic_by_formula[i].append(ic_m.item())
+                train_scores = train_scores / max(1, len(folds))
+                val_scores = val_scores / max(1, len(folds))
+
+            corr_slice = (folds[0]["train_start"], folds[0]["train_end"])
+            results: list[dict] = []
+            for i, fml in enumerate(formulas):
+                if not bool(valid[i]):
+                    results.append({'idx': i, 'status': 'none', 'reward': -5.0,
+                                    'val_score': -5.0, 'fml': fml})
+                    continue
+
+                res = factors[i]
+                if res.std() < 1e-4:
+                    results.append({'idx': i, 'status': 'const', 'reward': -2.0,
+                                    'val_score': -2.0, 'fml': fml})
+                    continue
+
+                reward = train_scores[i]
+                val_score_out = val_scores[i]
+                rp = _repetition_penalty(fml)
+                if rp > 0:
+                    reward = reward - rp
+                    val_score_out = val_score_out - rp
+
+                reward = self._apply_corr_penalty(reward, res, corr_slice)
+                val_score_out = self._apply_corr_penalty(val_score_out, res, corr_slice)
+                ic_full, ic_stab_full = AlphaEngine._compute_ic(res, t_ret)
+                ic_values = ic_by_formula[i]
+                ic_i = sum(ic_values) / len(ic_values) if ic_values else 0.0
+                results.append({
+                    'idx': i, 'status': 'ok',
+                    'reward': reward.item() if isinstance(reward, torch.Tensor) else float(reward),
+                    'val_score': val_score_out.item() if isinstance(val_score_out, torch.Tensor) else float(val_score_out),
+                    'ic_full': ic_full.item(), 'ic_stab': ic_stab_full.item(),
+                    'ic_i': ic_i, 'res': res, 'fml': fml,
+                })
+            return results
+        except Exception:
+            if ModelConfig.GPU_BATCH_EVAL_STRICT:
+                raise
+            return [
+                self._eval_formula_task(i, fml, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+                for i, fml in enumerate(formulas)
+            ]
 
     @staticmethod
     def _compute_ic(factor: torch.Tensor, target_ret: torch.Tensor
@@ -838,7 +942,11 @@ class AlphaEngine:
             factor_pool_snapshot = list(self.factor_pool)
 
             # 并行提交所有公式评估任务
-            if self._eval_pool is not None and self._eval_workers > 1 and tot > 1:
+            if ModelConfig.GPU_BATCH_EVAL and use_wf:
+                results = self._eval_formula_batch_tasks(
+                    all_fmls, feat, t_ret, folds, use_wf, factor_pool_snapshot,
+                )
+            elif self._eval_pool is not None and self._eval_workers > 1 and tot > 1:
                 from concurrent.futures import ThreadPoolExecutor
                 futures = [
                     self._eval_pool.submit(
