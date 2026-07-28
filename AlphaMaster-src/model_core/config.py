@@ -5,9 +5,26 @@ model_core/config.py — 模型层配置
 品种、数据、风控等全局配置统一由根目录 config.py 的 Config 类管理。
 """
 import math
+import os
 
 import torch
 from .vocab import FORMULA_VOCAB
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _select_device() -> torch.device:
+    mode = os.getenv("ALPHAMASTER_DEVICE", "cpu").strip().lower()
+    if mode == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if mode == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
 
 
 class ModelConfig:
@@ -26,7 +43,10 @@ class ModelConfig:
     #   cpu : 1.91 s/步  Best=5.103
     #   加速比 = 0.43x（GPU 反而慢 2.3 倍）
     # 若后续改为批量并行公式评估（一次喂大批张量进 GPU），再切回 cuda。
-    DEVICE = torch.device("cpu")
+    DEVICE_MODE = os.getenv("ALPHAMASTER_DEVICE", "cpu").strip().lower()
+    DEVICE = _select_device()
+    GPU_BATCH_EVAL: bool = _env_bool("ALPHAMASTER_GPU_BATCH_EVAL", False)
+    GPU_BATCH_EVAL_STRICT: bool = _env_bool("ALPHAMASTER_GPU_BATCH_EVAL_STRICT", True)
 
     # ── 训练参数（大搜索空间适配版，2026-07-04 重构）─────────────────────
     # 背景：特征库扩展到 65、算子库扩展到 66（vocab=131），8-token 搜索空间
