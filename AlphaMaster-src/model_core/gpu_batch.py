@@ -14,8 +14,8 @@ import torch
 from torch import Tensor
 
 from strategy_manager.signal import compute_target_positions_stateless
+from .batch_ops import BATCH_OPS_CONFIG
 from .config import ModelConfig
-from .ops import OPS_CONFIG
 from .vocab import FORMULA_VOCAB
 
 
@@ -35,78 +35,60 @@ class BatchPipelineResult:
     oos_sortino: Tensor
 
 
-class BatchStackVM:
-    """Batch StackVM for the single-symbol path.
-
-    Existing operator functions consume [N, T] tensors and use dim=1 as time.
-    For N=1, multiple candidate formulas can safely be treated as independent
-    pseudo-symbol rows [B, T] while each operator runs.  The result is reshaped
-    back to [B, 1, T].
-    """
+class BatchStackVM3D:
+    """Shape-correct batch StackVM for both single-symbol and multi-symbol data."""
 
     def __init__(self):
         self.feat_offset = FORMULA_VOCAB.operator_offset
-        self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(OPS_CONFIG)}
-        self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(OPS_CONFIG)}
-        self.single_symbol_identity_ops = {
-            FORMULA_VOCAB.token_names.index(name)
-            for name in ("CS_RANK", "CS_SCALE", "CS_NEUTRALIZE")
-            if name in FORMULA_VOCAB.token_names
-        }
+        self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
+        self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
 
     @staticmethod
     def _normalize_output_batch(x: Tensor) -> Tensor:
-        """Normalize [B,1,T] using the same single-symbol expanding z-score."""
+        """Normalize [B,N,T] exactly like StackVM does per formula."""
         bsz, n_symbols, n_bars = x.shape
-        if n_symbols != 1:
-            raise ValueError("BatchStackVM first version supports single-symbol factors only")
-
-        flat = x[:, 0, :]
+        flat = x.reshape(bsz, -1)
         global_std = flat.std(dim=1)
         const = global_std < 1e-6
 
+        if n_symbols > 1:
+            cs_mean = x.mean(dim=1, keepdim=True)
+            cs_std = x.std(dim=1, keepdim=True).clamp(min=1e-8)
+            cs_z = torch.clamp((x - cs_mean) / cs_std, -3.0, 3.0)
+            return torch.where(const[:, None, None], x, cs_z)
+
+        single = x[:, 0, :]
         cnt = torch.arange(1, n_bars + 1, device=x.device, dtype=x.dtype).view(1, n_bars)
-        cumsum = flat.cumsum(dim=1)
-        ts_mean = cumsum / cnt
-        cumsum_sq = (flat * flat).cumsum(dim=1)
-        ts_var = (cumsum_sq / cnt) - ts_mean * ts_mean
+        ts_mean = single.cumsum(dim=1) / cnt
+        ts_var = ((single * single).cumsum(dim=1) / cnt) - ts_mean * ts_mean
         ts_std = ts_var.clamp(min=1e-8).sqrt()
-        ts_z = torch.clamp((flat - ts_mean) / ts_std, -3.0, 3.0)
-        out = torch.where(const[:, None], flat, ts_z)
+        ts_z = torch.clamp((single - ts_mean) / ts_std, -3.0, 3.0)
+        out = torch.where(const[:, None], single, ts_z)
         return out[:, None, :]
 
     def execute_batch(self, formulas: Tensor | list[list[int]], feat_tensor: Tensor) -> tuple[Tensor, Tensor]:
-        """Execute formulas as one batch.
-
-        Args:
-            formulas: [B, L] token ids.
-            feat_tensor: [1, F, T] feature tensor.
-
-        Returns:
-            factors: [B, 1, T], zero-filled for invalid formulas.
-            valid: [B] boolean mask.
-        """
         if not torch.is_tensor(formulas):
             formulas = torch.tensor(formulas, dtype=torch.long, device=feat_tensor.device)
         else:
             formulas = formulas.to(device=feat_tensor.device, dtype=torch.long)
         if formulas.ndim != 2:
             raise ValueError(f"formulas must be [B,L], got {tuple(formulas.shape)}")
-        if feat_tensor.ndim != 3 or feat_tensor.shape[0] != 1:
-            raise ValueError("BatchStackVM first version requires feat_tensor shaped [1,F,T]")
+        if feat_tensor.ndim != 3:
+            raise ValueError(f"feat_tensor must be [N,F,T], got {tuple(feat_tensor.shape)}")
 
         bsz, max_len = formulas.shape
-        _, n_features, n_bars = feat_tensor.shape
+        n_symbols, n_features, n_bars = feat_tensor.shape
         stack = torch.zeros(
             bsz,
             max_len,
+            n_symbols,
             n_bars,
             dtype=feat_tensor.dtype,
             device=feat_tensor.device,
         )
         ptr = torch.zeros(bsz, dtype=torch.long, device=feat_tensor.device)
         valid = torch.ones(bsz, dtype=torch.bool, device=feat_tensor.device)
-        feat_rows = feat_tensor[0]
+        feat_bank = feat_tensor.permute(1, 0, 2)
 
         for step in range(max_len):
             tok = formulas[:, step]
@@ -119,7 +101,7 @@ class BatchStackVM:
                 ok = feat_ids < n_features
                 if ok.any():
                     idx_ok = idx[ok]
-                    stack[idx_ok, ptr[idx_ok], :] = feat_rows[feat_ids[ok], :]
+                    stack[idx_ok, ptr[idx_ok], :, :] = feat_bank[feat_ids[ok], :, :]
                     ptr[idx_ok] += 1
                 if (~ok).any():
                     valid[idx[~ok]] = False
@@ -142,29 +124,24 @@ class BatchStackVM:
                         continue
 
                     base = ptr[idx] - arity
-                    args = []
-                    for off in range(arity):
-                        args.append(stack[idx, base + off, :])
+                    args = [stack[idx, base + off, :, :] for off in range(arity)]
                     try:
-                        if op_tok in self.single_symbol_identity_ops:
-                            res = torch.nan_to_num(args[0], nan=0.0, posinf=0.0, neginf=0.0)
-                        else:
-                            res = self.op_map[op_tok](*args)
+                        res = self.op_map[op_tok](*args)
                     except Exception:
                         valid[idx] = False
                         continue
-                    if res.shape != (idx.numel(), n_bars):
+                    if res.shape != (idx.numel(), n_symbols, n_bars):
                         valid[idx] = False
                         continue
                     res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
-                    stack[idx, base, :] = res
+                    stack[idx, base, :, :] = res
                     ptr[idx] = base + 1
 
         valid = valid & (ptr == 1)
-        factors = torch.zeros(bsz, 1, n_bars, dtype=feat_tensor.dtype, device=feat_tensor.device)
+        factors = torch.zeros(bsz, n_symbols, n_bars, dtype=feat_tensor.dtype, device=feat_tensor.device)
         if valid.any():
             idx = torch.nonzero(valid, as_tuple=False).flatten()
-            factors[idx, 0, :] = stack[idx, 0, :]
+            factors[idx, :, :] = stack[idx, 0, :, :]
             factors[idx] = self._normalize_output_batch(factors[idx])
         return factors, valid
 
@@ -288,6 +265,58 @@ class BatchBacktestEvaluator:
         hold_bonus = torch.where(total_trades > 0, hold_bonus, torch.zeros_like(hold_bonus))
         return freq_score + hold_bonus
 
+    def _symbol_consistency_batch(self, pnl: Tensor, position: Tensor) -> Tensor:
+        bsz, n_symbols, n_bars = pnl.shape
+        if n_symbols == 0:
+            return torch.zeros(bsz, dtype=pnl.dtype, device=pnl.device)
+        per_sortino = self._sortino_by_symbol_batch(pnl, self.periods_per_year)
+        pos_abs = position.abs()
+        diff = (pos_abs[:, :, 1:] - pos_abs[:, :, :-1]).abs()
+        trades = (diff > 0.1).sum(dim=2)
+        min_trades = max(5, n_bars // 100)
+        inactive = trades < min_trades
+        inactive_ratio = inactive.float().mean(dim=1)
+        any_bad = (per_sortino < -2.0).any(dim=1)
+        active = ~inactive
+        active_count = active.sum(dim=1)
+        positive_active = ((per_sortino > 0) & active).sum(dim=1)
+        ratio = positive_active.to(pnl.dtype) / active_count.clamp(min=1).to(pnl.dtype)
+        score = torch.where(
+            ratio < 0.6,
+            (ratio - 0.6) / 0.6,
+            (ratio - 0.6) / 0.4,
+        )
+        score = torch.where(ratio == 1.0, score + 0.5, score)
+        score = torch.where(active_count == 0, torch.full_like(score, -3.0), score)
+        score = torch.where(any_bad, torch.full_like(score, -2.0), score)
+        score = torch.where(inactive_ratio > 0.4, torch.full_like(score, -3.0), score)
+        return score
+
+    def _cost_stress_batch(self, position: Tensor, target_ret: Tensor, stress_mult: float = 2.0) -> Tensor:
+        prev_pos = torch.roll(position, 1, dims=2)
+        prev_pos[:, :, 0] = 0.0
+        turnover = torch.abs(position - prev_pos)
+        stressed_pnl = position * target_ret.unsqueeze(0) - turnover * self.cost_rate * stress_mult
+        return torch.clamp(self._sortino_batch(stressed_pnl, self.periods_per_year), -5.0, 5.0)
+
+    @staticmethod
+    def _sortino_by_symbol_batch(pnl: Tensor, periods_per_year: int = 6240, eps: float = 1e-8) -> Tensor:
+        bsz, n_symbols, _ = pnl.shape
+        flat = pnl
+        mean_pnl = flat.mean(dim=2)
+        downside_mask = flat < 0
+        downside_count = downside_mask.sum(dim=2)
+        downside = torch.where(downside_mask, flat, torch.zeros_like(flat))
+        downside_mean = downside.sum(dim=2) / downside_count.clamp(min=1)
+        centered = torch.where(downside_mask, flat - downside_mean[:, :, None], torch.zeros_like(flat))
+        raw_std = torch.sqrt((centered.square().sum(dim=2) / downside_count.clamp(min=1)).clamp(min=0.0))
+        raw_std = torch.where(downside_count > 0, raw_std, torch.zeros_like(raw_std))
+        full_std = flat.std(dim=2, unbiased=False).clamp(min=eps)
+        floor = (full_std * 0.2).clamp(min=eps)
+        downside_std = torch.maximum(raw_std, floor)
+        score = mean_pnl / downside_std * math.sqrt(periods_per_year)
+        return torch.clamp(score, -20.0, 20.0)
+
     @staticmethod
     def _exposure_penalty_batch(position: Tensor) -> Tensor:
         exposure = position.abs().reshape(position.shape[0], -1).mean(dim=1)
@@ -339,6 +368,12 @@ class BatchBacktestEvaluator:
         beta = self._beta_neutral_penalty_batch(position)
         consist = self._half_consistency_bonus_batch(pnl)
 
+        if factors.shape[1] > 1:
+            sym_cons = self._symbol_consistency_batch(pnl, position)
+            cost_s = self._cost_stress_batch(position, target_ret)
+            if ModelConfig.REWARD_MODE == "ftmo":
+                return 0.75 * ann_ret + 0.05 * sortino + 0.10 * calmar + 0.02 * ts_ic + 0.03 * sym_cons + 0.02 * cost_s + 0.03 * tq + exposure + beta + consist
+            return 0.60 * ann_ret + 0.10 * sortino + 0.05 * calmar + 0.10 * ts_ic + 0.05 * sym_cons + 0.05 * cost_s + 0.05 * tq + exposure + beta + consist
         if ModelConfig.REWARD_MODE == "ftmo":
             return 0.80 * ann_ret + 0.05 * sortino + 0.10 * calmar + 0.03 * ts_ic + 0.02 * tq + exposure + beta + consist
         return 0.60 * ann_ret + 0.15 * sortino + 0.10 * calmar + 0.10 * ts_ic + 0.05 * tq + exposure + beta + consist
@@ -390,7 +425,7 @@ class BatchFormulaPipeline:
     """Full single-symbol batch path: formulas -> factors -> scores."""
 
     def __init__(self, cost_rate: float = 0.0003, periods_per_year: int = 6240):
-        self.vm = BatchStackVM()
+        self.vm = BatchStackVM3D()
         self.bt = BatchBacktestEvaluator(cost_rate=cost_rate, periods_per_year=periods_per_year)
 
     def evaluate_fold_batch(

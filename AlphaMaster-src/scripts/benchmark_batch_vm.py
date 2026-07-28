@@ -12,7 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model_core.gpu_batch import BatchStackVM
+from model_core.gpu_batch import BatchStackVM3D
 from model_core.vm import StackVM
 from model_core.vocab import FORMULA_VOCAB
 
@@ -40,6 +40,7 @@ def sync(device: torch.device) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=192)
+    parser.add_argument("--symbols", type=int, default=1)
     parser.add_argument("--features", type=int, default=FORMULA_VOCAB.feature_count)
     parser.add_argument("--bars", type=int, default=7247)
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="auto")
@@ -53,12 +54,12 @@ def main() -> None:
         device = torch.device(args.device)
 
     torch.manual_seed(11)
-    feat = torch.randn(1, args.features, args.bars, device=device)
+    feat = torch.randn(args.symbols, args.features, args.bars, device=device)
     formulas = sample_formulas(args.batch)
     formula_t = torch.tensor(formulas, dtype=torch.long, device=device)
 
     scalar_vm = StackVM()
-    batch_vm = BatchStackVM()
+    batch_vm = BatchStackVM3D()
 
     sync(device)
     t0 = time.perf_counter()
@@ -67,7 +68,7 @@ def main() -> None:
     for fml in formulas:
         res = scalar_vm.execute(fml, feat)
         scalar_valid.append(res is not None)
-        scalar_results.append(torch.zeros(1, args.bars, device=device) if res is None else res)
+        scalar_results.append(torch.zeros(args.symbols, args.bars, device=device) if res is None else res)
     scalar_t = torch.stack(scalar_results, dim=0)
     scalar_valid_t = torch.tensor(scalar_valid, dtype=torch.bool, device=device)
     sync(device)
@@ -84,7 +85,7 @@ def main() -> None:
     speedup = scalar_s / batch_s if batch_s > 0 else float("inf")
     print(f"device={device}")
     print(f"torch={torch.__version__} cuda_available={torch.cuda.is_available()} cuda={torch.version.cuda}")
-    print(f"shape: formulas=[{args.batch},8] feat=[1,{args.features},{args.bars}]")
+    print(f"shape: formulas=[{args.batch},8] feat=[{args.symbols},{args.features},{args.bars}]")
     print(f"scalar_vm_seconds={scalar_s:.4f}")
     print(f"batch_vm_seconds={batch_s:.4f}")
     print(f"speedup={speedup:.2f}x")

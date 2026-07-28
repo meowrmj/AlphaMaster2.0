@@ -41,6 +41,7 @@ def sync(device: torch.device) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=192)
+    parser.add_argument("--symbols", type=int, default=1)
     parser.add_argument("--features", type=int, default=FORMULA_VOCAB.feature_count)
     parser.add_argument("--bars", type=int, default=7247)
     parser.add_argument("--periods-per-year", type=int, default=3612)
@@ -55,8 +56,8 @@ def main() -> None:
         device = torch.device(args.device)
 
     torch.manual_seed(17)
-    feat = torch.randn(1, args.features, args.bars, device=device)
-    target_ret = torch.randn(1, args.bars, device=device) * 0.002
+    feat = torch.randn(args.symbols, args.features, args.bars, device=device)
+    target_ret = torch.randn(args.symbols, args.bars, device=device) * 0.002
     split = int(args.bars * 0.8)
     train_start, train_end = 0, max(10, split // 2)
     val_start, val_end = train_end, split
@@ -118,7 +119,7 @@ def main() -> None:
 
     print(f"device={device}")
     print(f"torch={torch.__version__} cuda_available={torch.cuda.is_available()} cuda={torch.version.cuda}")
-    print(f"shape: formulas=[{args.batch},8] feat=[1,{args.features},{args.bars}]")
+    print(f"shape: formulas=[{args.batch},8] feat=[{args.symbols},{args.features},{args.bars}]")
     print(f"scalar_pipeline_seconds={scalar_s:.4f}")
     print(f"batch_pipeline_seconds={batch_s:.4f}")
     print(f"speedup={speedup:.2f}x")
