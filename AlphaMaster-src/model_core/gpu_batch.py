@@ -95,6 +95,55 @@ class BatchBacktestEvaluator:
         return -torch.clamp((mean_to - 0.2) * 3.0, min=0.0, max=3.0)
 
     @staticmethod
+    def _turnover_quality_batch(position: Tensor) -> Tensor:
+        """Replicate MT5Backtest._turnover_quality for each batch row."""
+        bsz, n_symbols, n_bars = position.shape
+        pos_i = position.to(torch.int32)
+        nonzero = pos_i != 0
+        prev = torch.roll(pos_i, 1, dims=2)
+        prev[:, :, 0] = 0
+        run_start = nonzero & (pos_i != prev)
+        total_trades = run_start.sum(dim=(1, 2)).to(position.dtype)
+
+        total_bars = n_symbols * n_bars
+        target_trades = max(total_bars / 12.0, 1.0)
+        actual_ratio = total_trades / target_trades
+        freq_score = torch.empty_like(actual_ratio)
+        freq_score = torch.where(actual_ratio <= 0, torch.full_like(freq_score, -2.0), freq_score)
+        freq_score = torch.where(
+            (actual_ratio > 0) & (actual_ratio < 0.05),
+            -2.0 + actual_ratio / 0.05,
+            freq_score,
+        )
+        freq_score = torch.where(
+            (actual_ratio >= 0.05) & (actual_ratio < 0.5),
+            -1.0 + (actual_ratio - 0.05) / 0.45,
+            freq_score,
+        )
+        freq_score = torch.where(
+            (actual_ratio >= 0.5) & (actual_ratio <= 2.0),
+            torch.exp(-0.5 * (torch.log(actual_ratio) / math.log(2.0)).square()),
+            freq_score,
+        )
+        freq_score = torch.where(
+            (actual_ratio > 2.0) & (actual_ratio <= 8.0),
+            0.5 - (actual_ratio - 2.0) / 6.0 * 1.5,
+            freq_score,
+        )
+        freq_score = torch.where(actual_ratio > 8.0, torch.full_like(freq_score, -2.0), freq_score)
+
+        # Sum run lengths by counting non-zero bars. This matches the scalar
+        # average because runs partition exactly the non-zero position bars.
+        nonzero_bars = nonzero.sum(dim=(1, 2)).to(position.dtype)
+        avg_hold = nonzero_bars / total_trades.clamp(min=1)
+        hold_bonus = torch.minimum(
+            torch.full_like(avg_hold, 0.3),
+            torch.log(torch.clamp(avg_hold, min=1.0)) / math.log(30.0) * 0.3,
+        )
+        hold_bonus = torch.where(total_trades > 0, hold_bonus, torch.zeros_like(hold_bonus))
+        return freq_score + hold_bonus
+
+    @staticmethod
     def _exposure_penalty_batch(position: Tensor) -> Tensor:
         exposure = position.abs().reshape(position.shape[0], -1).mean(dim=1)
         penalty = (exposure / 0.10 - 1.0) * 2.0
@@ -140,13 +189,14 @@ class BatchBacktestEvaluator:
         sortino = self._sortino_batch(pnl, self.periods_per_year)
         calmar = self._calmar_batch(pnl, self.periods_per_year)
         ts_ic = self._ts_ic_stability_batch(factors, target_ret)
+        tq = self._turnover_quality_batch(position)
         exposure = self._exposure_penalty_batch(position)
         beta = self._beta_neutral_penalty_batch(position)
         consist = self._half_consistency_bonus_batch(pnl)
 
         if ModelConfig.REWARD_MODE == "ftmo":
-            return 0.80 * ann_ret + 0.05 * sortino + 0.10 * calmar + 0.03 * ts_ic + exposure + beta + consist
-        return 0.60 * ann_ret + 0.15 * sortino + 0.10 * calmar + 0.10 * ts_ic + exposure + beta + consist
+            return 0.80 * ann_ret + 0.05 * sortino + 0.10 * calmar + 0.03 * ts_ic + 0.02 * tq + exposure + beta + consist
+        return 0.60 * ann_ret + 0.15 * sortino + 0.10 * calmar + 0.10 * ts_ic + 0.05 * tq + exposure + beta + consist
 
     def evaluate_fold_batch(
         self,
