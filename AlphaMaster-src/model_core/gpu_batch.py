@@ -15,6 +15,8 @@ from torch import Tensor
 
 from strategy_manager.signal import compute_target_positions_stateless
 from .config import ModelConfig
+from .ops import OPS_CONFIG
+from .vocab import FORMULA_VOCAB
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,140 @@ class BatchEvalResult:
     train_scores: Tensor
     val_scores: Tensor
     oos_sortino: Tensor
+
+
+class BatchStackVM:
+    """Batch StackVM for the single-symbol path.
+
+    Existing operator functions consume [N, T] tensors and use dim=1 as time.
+    For N=1, multiple candidate formulas can safely be treated as independent
+    pseudo-symbol rows [B, T] while each operator runs.  The result is reshaped
+    back to [B, 1, T].
+    """
+
+    def __init__(self):
+        self.feat_offset = FORMULA_VOCAB.operator_offset
+        self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(OPS_CONFIG)}
+        self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(OPS_CONFIG)}
+        self.single_symbol_identity_ops = {
+            FORMULA_VOCAB.token_names.index(name)
+            for name in ("CS_RANK", "CS_SCALE", "CS_NEUTRALIZE")
+            if name in FORMULA_VOCAB.token_names
+        }
+
+    @staticmethod
+    def _normalize_output_batch(x: Tensor) -> Tensor:
+        """Normalize [B,1,T] using the same single-symbol expanding z-score."""
+        bsz, n_symbols, n_bars = x.shape
+        if n_symbols != 1:
+            raise ValueError("BatchStackVM first version supports single-symbol factors only")
+
+        flat = x[:, 0, :]
+        global_std = flat.std(dim=1)
+        const = global_std < 1e-6
+
+        cnt = torch.arange(1, n_bars + 1, device=x.device, dtype=x.dtype).view(1, n_bars)
+        cumsum = flat.cumsum(dim=1)
+        ts_mean = cumsum / cnt
+        cumsum_sq = (flat * flat).cumsum(dim=1)
+        ts_var = (cumsum_sq / cnt) - ts_mean * ts_mean
+        ts_std = ts_var.clamp(min=1e-8).sqrt()
+        ts_z = torch.clamp((flat - ts_mean) / ts_std, -3.0, 3.0)
+        out = torch.where(const[:, None], flat, ts_z)
+        return out[:, None, :]
+
+    def execute_batch(self, formulas: Tensor | list[list[int]], feat_tensor: Tensor) -> tuple[Tensor, Tensor]:
+        """Execute formulas as one batch.
+
+        Args:
+            formulas: [B, L] token ids.
+            feat_tensor: [1, F, T] feature tensor.
+
+        Returns:
+            factors: [B, 1, T], zero-filled for invalid formulas.
+            valid: [B] boolean mask.
+        """
+        if not torch.is_tensor(formulas):
+            formulas = torch.tensor(formulas, dtype=torch.long, device=feat_tensor.device)
+        else:
+            formulas = formulas.to(device=feat_tensor.device, dtype=torch.long)
+        if formulas.ndim != 2:
+            raise ValueError(f"formulas must be [B,L], got {tuple(formulas.shape)}")
+        if feat_tensor.ndim != 3 or feat_tensor.shape[0] != 1:
+            raise ValueError("BatchStackVM first version requires feat_tensor shaped [1,F,T]")
+
+        bsz, max_len = formulas.shape
+        _, n_features, n_bars = feat_tensor.shape
+        stack = torch.zeros(
+            bsz,
+            max_len,
+            n_bars,
+            dtype=feat_tensor.dtype,
+            device=feat_tensor.device,
+        )
+        ptr = torch.zeros(bsz, dtype=torch.long, device=feat_tensor.device)
+        valid = torch.ones(bsz, dtype=torch.bool, device=feat_tensor.device)
+        feat_rows = feat_tensor[0]
+
+        for step in range(max_len):
+            tok = formulas[:, step]
+            active = valid
+
+            feat_mask = active & (tok < self.feat_offset)
+            if feat_mask.any():
+                idx = torch.nonzero(feat_mask, as_tuple=False).flatten()
+                feat_ids = tok[idx]
+                ok = feat_ids < n_features
+                if ok.any():
+                    idx_ok = idx[ok]
+                    stack[idx_ok, ptr[idx_ok], :] = feat_rows[feat_ids[ok], :]
+                    ptr[idx_ok] += 1
+                if (~ok).any():
+                    valid[idx[~ok]] = False
+
+            op_active = active & (tok >= self.feat_offset)
+            if op_active.any():
+                op_tokens = torch.unique(tok[op_active])
+                for op_tok_t in op_tokens:
+                    op_tok = int(op_tok_t.item())
+                    idx = torch.nonzero(op_active & (tok == op_tok), as_tuple=False).flatten()
+                    if op_tok not in self.op_map:
+                        valid[idx] = False
+                        continue
+                    arity = self.arity_map[op_tok]
+                    enough = ptr[idx] >= arity
+                    if (~enough).any():
+                        valid[idx[~enough]] = False
+                    idx = idx[enough]
+                    if idx.numel() == 0:
+                        continue
+
+                    base = ptr[idx] - arity
+                    args = []
+                    for off in range(arity):
+                        args.append(stack[idx, base + off, :])
+                    try:
+                        if op_tok in self.single_symbol_identity_ops:
+                            res = torch.nan_to_num(args[0], nan=0.0, posinf=0.0, neginf=0.0)
+                        else:
+                            res = self.op_map[op_tok](*args)
+                    except Exception:
+                        valid[idx] = False
+                        continue
+                    if res.shape != (idx.numel(), n_bars):
+                        valid[idx] = False
+                        continue
+                    res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                    stack[idx, base, :] = res
+                    ptr[idx] = base + 1
+
+        valid = valid & (ptr == 1)
+        factors = torch.zeros(bsz, 1, n_bars, dtype=feat_tensor.dtype, device=feat_tensor.device)
+        if valid.any():
+            idx = torch.nonzero(valid, as_tuple=False).flatten()
+            factors[idx, 0, :] = stack[idx, 0, :]
+            factors[idx] = self._normalize_output_batch(factors[idx])
+        return factors, valid
 
 
 class BatchBacktestEvaluator:
