@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import torch
 
-from .formula_ir import FormulaCompiler, FormulaIR, FormulaPlan, annotate_support
+from .formula_ir import BackendRegistry, FormulaCompiler, FormulaIR, FormulaPlan
 
 
 EvalFn = Callable[
@@ -236,6 +236,9 @@ class EvaluatorRouter:
         self.last_engine = "standard"
         self.last_guard_report = EvalGuardReport()
         self.compiler = FormulaCompiler()
+        self.registry = BackendRegistry()
+        self.registry.register(self.fast)
+        self.registry.register(self.standard)
         self.last_plan: FormulaPlan | None = None
         self.last_fast_coverage = 0.0
         self.last_invalid_count = 0
@@ -253,7 +256,7 @@ class EvaluatorRouter:
         prefer_fast: bool,
     ) -> list[dict[str, Any]]:
         plan = self.compiler.compile_batch(formulas)
-        plan = annotate_support(plan, [self.fast, self.standard])
+        plan = self.registry.annotate(plan)
         self.last_plan = plan
         self.last_fast_coverage = plan.coverage(self.fast.name)
         self.last_invalid_count = plan.invalid_count

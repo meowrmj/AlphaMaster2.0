@@ -154,6 +154,32 @@ class BackendSelector:
         return self.backends[-1]
 
 
+class BackendRegistry:
+    """Ordered backend registry used as a responsibility chain.
+
+    Backends are registered from fastest/most specific to slowest/most general.
+    The final backend should normally be the standard interpreter.
+    """
+
+    def __init__(self):
+        self._backends: list[FormulaBackend] = []
+
+    def register(self, backend: FormulaBackend) -> None:
+        if any(b.name == backend.name for b in self._backends):
+            raise ValueError(f"backend already registered: {backend.name}")
+        self._backends.append(backend)
+
+    @property
+    def backends(self) -> tuple[FormulaBackend, ...]:
+        return tuple(self._backends)
+
+    def annotate(self, plan: FormulaPlan) -> FormulaPlan:
+        return annotate_support(plan, list(self._backends))
+
+    def select(self, plan: FormulaPlan, prefer_fast: bool = True) -> FormulaBackend:
+        return BackendSelector(list(self._backends)).select(plan, prefer_fast=prefer_fast)
+
+
 def annotate_support(plan: FormulaPlan, backends: list[FormulaBackend]) -> FormulaPlan:
     support: dict[str, bool] = {}
     for backend in backends:
