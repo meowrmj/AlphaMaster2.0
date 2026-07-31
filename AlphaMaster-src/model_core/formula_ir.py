@@ -19,6 +19,7 @@ class FormulaNode:
     """A node in the stack-formula intermediate representation."""
 
     id: int
+    position: int
     kind: str
     token: int
     name: str
@@ -97,14 +98,14 @@ class FormulaCompiler:
         feature_names: list[str] = []
         tokens = tuple(int(t) for t in formula)
 
-        for token in tokens:
+        for position, token in enumerate(tokens):
             if token < 0 or token >= len(self.names):
                 return FormulaIR(tokens, tuple(nodes), None, False, f"unknown token {token}")
 
             name = self.names[token]
             node_id = len(nodes)
             if token < self.feat_offset:
-                nodes.append(FormulaNode(node_id, "feature", token, name))
+                nodes.append(FormulaNode(node_id, position, "feature", token, name))
                 stack.append(node_id)
                 feature_names.append(name)
                 continue
@@ -117,7 +118,7 @@ class FormulaCompiler:
 
             inputs = tuple(stack[-arity:])
             del stack[-arity:]
-            nodes.append(FormulaNode(node_id, "operator", token, name, inputs))
+            nodes.append(FormulaNode(node_id, position, "operator", token, name, inputs))
             stack.append(node_id)
             op_names.append(name)
 

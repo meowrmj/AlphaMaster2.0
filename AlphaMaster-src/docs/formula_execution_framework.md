@@ -147,3 +147,46 @@ cuda_fused -> torch_batch -> standard
 3. 每个 fused 后端必须先通过 ScoreGuard。
 4. 页面显示后端名称、覆盖率、校验差异、回退次数。
 5. 只有结果完全对齐后，才允许作为训练默认路径。
+
+## Kernel 优化层
+
+Kernel 优化不应该直接侵入训练主循环。它应该先做成独立计划层：
+
+```mermaid
+flowchart TD
+    A["候选公式批次"] --> B["KernelPlanner"]
+    B --> C["按 token 阶段分组"]
+    C --> D["按算子族分桶"]
+    D --> E["KernelExecutionPlan"]
+    E --> F["PlanCache"]
+    F --> G["未来 fused kernel 后端"]
+```
+
+核心文件：
+
+- `model_core/kernel_planner.py`
+
+核心对象：
+
+- `KernelPlanner`：把一批公式转成 kernel 分桶计划。
+- `KernelBucket`：同一执行阶段、同一算子、同一参数形态的一组公式。
+- `KernelExecutionPlan`：一批公式的 launch 优化计划。
+- `KernelPlanCache`：缓存重复公式批次，避免每步重复解析。
+
+这个计划层只分析，不执行，不改分数。它的作用是回答：
+
+- 哪些算子能合并成一个 kernel。
+- 哪些算子频率最高，最值得写底层 fused kernel。
+- 理论上能减少多少 kernel launch。
+- 哪些公式或算子还不支持，需要回退。
+
+当前真实 checkpoint 初步观察：
+
+```text
+最近 4 个 D1 checkpoint：
+naive launches = 995
+bucketed launches = 504
+理论 launch 减少约 49.3%
+```
+
+这说明“按算子分桶 + 合并 kernel”的方向确实有空间。但这只是调度层证据，不代表已经真实提速；真实提速必须等 fused kernel 后端实现后，再和标准解释器做数值对齐与计时对比。
