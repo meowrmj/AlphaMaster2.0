@@ -73,6 +73,8 @@ def main() -> None:
         f"fallback_launches={backend_report.fallback_launches} "
         f"reason={backend_report.reason!r}"
     )
+    print(f"fallback_ops={backend_report.fallback_ops[:12]}")
+    print(f"fallback_families={backend_report.fallback_families}")
     print(
         f"hot_plan_ms avg={statistics.mean(hot_times):.6f} "
         f"p50={statistics.median(hot_times):.6f} "
