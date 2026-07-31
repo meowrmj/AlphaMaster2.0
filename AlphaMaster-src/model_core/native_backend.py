@@ -14,6 +14,21 @@ ROOT = pathlib.Path(__file__).resolve().parent
 NATIVE_DIR = ROOT / "native"
 
 
+NATIVE_BINARY_OPS = {
+    "ADD": 1,
+    "SUB": 2,
+    "MUL": 3,
+    "DIV": 4,
+    "MAX": 5,
+    "MIN": 6,
+}
+
+NATIVE_TERNARY_OPS = {
+    "IF_GT": 101,
+    "GATE": 102,
+}
+
+
 @dataclass(frozen=True)
 class NativeBuildStatus:
     available: bool
@@ -54,3 +69,26 @@ def load_native_extension(verbose: bool = False):
         verbose=verbose,
         with_cuda=True,
     )
+
+
+class NativeElementwiseOps:
+    """Thin checked wrapper around the optional native extension."""
+
+    def __init__(self, ext=None, verbose: bool = False):
+        self.ext = ext if ext is not None else load_native_extension(verbose=verbose)
+
+    @staticmethod
+    def supports(op_name: str, arity: int) -> bool:
+        if arity == 2:
+            return op_name in NATIVE_BINARY_OPS
+        if arity == 3:
+            return op_name in NATIVE_TERNARY_OPS
+        return False
+
+    def apply(self, op_name: str, *args: torch.Tensor) -> torch.Tensor:
+        arity = len(args)
+        if arity == 2 and op_name in NATIVE_BINARY_OPS:
+            return self.ext.elementwise2(args[0], args[1], NATIVE_BINARY_OPS[op_name])
+        if arity == 3 and op_name in NATIVE_TERNARY_OPS:
+            return self.ext.elementwise3(args[0], args[1], args[2], NATIVE_TERNARY_OPS[op_name])
+        raise NotImplementedError(f"native op not supported: {op_name}/{arity}")
