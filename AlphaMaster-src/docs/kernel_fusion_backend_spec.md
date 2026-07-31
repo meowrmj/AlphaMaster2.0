@@ -113,6 +113,45 @@ DELAY1/DELAY4
 MOMENTUM_5/10
 ```
 
+## 第二批 native rolling/shift 覆盖
+
+已加入第二批 native kernel 骨架：
+
+```text
+SHIFT:
+DELAY1 / DELAY4 / DELTA / DELTA_5
+
+ROLLING:
+TS_MEAN_5/10/20
+TS_SUM_5/10/20
+TS_ZSCORE_10/20
+```
+
+dry-run 覆盖变化：
+
+```text
+bucketed launches = 185
+native executable = 89
+fallback = 96
+```
+
+剩余主要缺口：
+
+```text
+DECAY
+TS_RANK_10/20
+WINSORIZE
+TS_MIN_20
+TS_MAX_10
+EMA_20
+MOMENTUM_5/10
+TS_QUANTILE_10
+CS_RANK
+TS_STD_10
+```
+
+注意：这些 kernel 还未在本机编译执行，因为当前缺 CUDA Toolkit/nvcc 与 MSVC cl.exe。工具链就绪后，必须先跑 `scripts/test_native_elementwise.py` 做数值对齐。
+
 ## 输入输出
 
 输入：

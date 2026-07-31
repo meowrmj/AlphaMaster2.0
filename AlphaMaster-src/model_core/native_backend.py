@@ -42,6 +42,24 @@ NATIVE_TERNARY_OPS = {
     "GATE": 102,
 }
 
+NATIVE_SHIFT_OPS = {
+    "DELAY1": 201,
+    "DELAY4": 204,
+    "DELTA": 211,
+    "DELTA_5": 215,
+}
+
+NATIVE_ROLLING_OPS = {
+    "TS_MEAN_5": 305,
+    "TS_MEAN_10": 310,
+    "TS_MEAN_20": 320,
+    "TS_SUM_5": 405,
+    "TS_SUM_10": 410,
+    "TS_SUM_20": 420,
+    "TS_ZSCORE_10": 510,
+    "TS_ZSCORE_20": 520,
+}
+
 
 @dataclass(frozen=True)
 class NativeBuildStatus:
@@ -116,7 +134,11 @@ class NativeElementwiseOps:
     @staticmethod
     def supports(op_name: str, arity: int) -> bool:
         if arity == 1:
-            return op_name in NATIVE_UNARY_OPS
+            return (
+                op_name in NATIVE_UNARY_OPS
+                or op_name in NATIVE_SHIFT_OPS
+                or op_name in NATIVE_ROLLING_OPS
+            )
         if arity == 2:
             return op_name in NATIVE_BINARY_OPS
         if arity == 3:
@@ -127,6 +149,10 @@ class NativeElementwiseOps:
         arity = len(args)
         if arity == 1 and op_name in NATIVE_UNARY_OPS:
             return self.ext.elementwise1(args[0], NATIVE_UNARY_OPS[op_name])
+        if arity == 1 and op_name in NATIVE_SHIFT_OPS:
+            return self.ext.shift1(args[0], NATIVE_SHIFT_OPS[op_name])
+        if arity == 1 and op_name in NATIVE_ROLLING_OPS:
+            return self.ext.rolling1(args[0], NATIVE_ROLLING_OPS[op_name])
         if arity == 2 and op_name in NATIVE_BINARY_OPS:
             return self.ext.elementwise2(args[0], args[1], NATIVE_BINARY_OPS[op_name])
         if arity == 3 and op_name in NATIVE_TERNARY_OPS:

@@ -14,6 +14,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model_core.native_backend import NativeElementwiseOps, probe_native_build
+from model_core.batch_ops import BATCH_OPS_CONFIG
+
+
+def _batch_op(name: str):
+    for op_name, func, _arity in BATCH_OPS_CONFIG:
+        if op_name == name:
+            return func
+    raise KeyError(name)
 
 
 def _time_cuda(fn, repeat: int) -> list[float]:
@@ -40,6 +48,10 @@ def main() -> None:
             "NEG", "ABS", "SIGN", "POWER", "SIGNED_POWER_2", "SIGNED_LOG", "SQRT",
             "CLIP", "SIGMOID", "TANH_SQUASH",
             "ADD", "SUB", "MUL", "DIV", "MAX", "MIN", "IF_GT", "GATE",
+            "DELAY1", "DELAY4", "DELTA", "DELTA_5",
+            "TS_MEAN_5", "TS_MEAN_10", "TS_MEAN_20",
+            "TS_SUM_5", "TS_SUM_10", "TS_SUM_20",
+            "TS_ZSCORE_10", "TS_ZSCORE_20",
         ],
     )
     args = parser.parse_args()
@@ -86,6 +98,15 @@ def main() -> None:
     elif args.op == "TANH_SQUASH":
         torch_fn = lambda: torch.tanh(a)
         native_fn = lambda: native.apply("TANH_SQUASH", a)
+    elif args.op in {
+        "DELAY1", "DELAY4", "DELTA", "DELTA_5",
+        "TS_MEAN_5", "TS_MEAN_10", "TS_MEAN_20",
+        "TS_SUM_5", "TS_SUM_10", "TS_SUM_20",
+        "TS_ZSCORE_10", "TS_ZSCORE_20",
+    }:
+        torch_op = _batch_op(args.op)
+        torch_fn = lambda: torch_op(a)
+        native_fn = lambda: native.apply(args.op, a)
     elif args.op == "ADD":
         torch_fn = lambda: a + b
         native_fn = lambda: native.apply("ADD", a, b)

@@ -93,12 +93,12 @@ class DryRunKernelBackend:
 
 
 class NativeElementwiseDryRunBackend(DryRunKernelBackend):
-    """Dry-run coverage for the first C++/CUDA native kernel batch."""
+    """Dry-run coverage for the current C++/CUDA native kernel batch."""
 
     name = "native_elementwise_dry_run"
 
     def __init__(self):
-        super().__init__(families={KernelFamily.ELEMENTWISE, KernelFamily.BRANCH})
+        super().__init__(families={KernelFamily.ELEMENTWISE, KernelFamily.BRANCH, KernelFamily.SHIFT, KernelFamily.ROLLING})
 
     def analyze(self, plan: KernelExecutionPlan) -> KernelBackendReport:
         executable = 0
@@ -106,7 +106,7 @@ class NativeElementwiseDryRunBackend(DryRunKernelBackend):
         fallback_families = Counter()
         for bucket in plan.buckets:
             can_execute = (
-                bucket.family in {KernelFamily.ELEMENTWISE, KernelFamily.BRANCH}
+                self.can_execute_family(bucket.family)
                 and NativeElementwiseOps.supports(bucket.op_name, bucket.arity)
             )
             if can_execute:

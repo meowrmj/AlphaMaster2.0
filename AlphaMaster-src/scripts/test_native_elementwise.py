@@ -11,6 +11,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model_core.native_backend import NativeElementwiseOps, probe_native_build
+from model_core.batch_ops import BATCH_OPS_CONFIG
+
+
+def _batch_op(name: str):
+    for op_name, func, _arity in BATCH_OPS_CONFIG:
+        if op_name == name:
+            return func
+    raise KeyError(name)
 
 
 def main() -> None:
@@ -41,6 +49,18 @@ def main() -> None:
         ("DIV", native.apply("DIV", a, b), a / (b + 1e-6)),
         ("IF_GT", native.apply("IF_GT", a, b, c), torch.where(a > 0, b, c)),
         ("GATE", native.apply("GATE", a, b, c), (a > 0).float() * b + (a <= 0).float() * c),
+        ("DELAY1", native.apply("DELAY1", a), _batch_op("DELAY1")(a)),
+        ("DELAY4", native.apply("DELAY4", a), _batch_op("DELAY4")(a)),
+        ("DELTA", native.apply("DELTA", a), _batch_op("DELTA")(a)),
+        ("DELTA_5", native.apply("DELTA_5", a), _batch_op("DELTA_5")(a)),
+        ("TS_MEAN_5", native.apply("TS_MEAN_5", a), _batch_op("TS_MEAN_5")(a)),
+        ("TS_MEAN_10", native.apply("TS_MEAN_10", a), _batch_op("TS_MEAN_10")(a)),
+        ("TS_MEAN_20", native.apply("TS_MEAN_20", a), _batch_op("TS_MEAN_20")(a)),
+        ("TS_SUM_5", native.apply("TS_SUM_5", a), _batch_op("TS_SUM_5")(a)),
+        ("TS_SUM_10", native.apply("TS_SUM_10", a), _batch_op("TS_SUM_10")(a)),
+        ("TS_SUM_20", native.apply("TS_SUM_20", a), _batch_op("TS_SUM_20")(a)),
+        ("TS_ZSCORE_10", native.apply("TS_ZSCORE_10", a), _batch_op("TS_ZSCORE_10")(a)),
+        ("TS_ZSCORE_20", native.apply("TS_ZSCORE_20", a), _batch_op("TS_ZSCORE_20")(a)),
     ]
     for name, got, expected in checks:
         diff = (got - torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)).abs().max().item()
