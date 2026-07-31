@@ -57,6 +57,10 @@ class FormulaPlan:
         covered = sum(1 for ir in self.irs if self.support.get(_support_key(backend_name, ir), False))
         return covered / len(self.irs)
 
+    @property
+    def invalid_count(self) -> int:
+        return sum(1 for ir in self.irs if not ir.valid)
+
 
 class FormulaBackend(Protocol):
     """Common contract for standard, PyTorch batch, and future fused backends."""
@@ -159,7 +163,8 @@ def annotate_support(plan: FormulaPlan, backends: list[FormulaBackend]) -> Formu
 
 
 def _support_key(backend_name: str, ir: FormulaIR) -> str:
-    return f"{backend_name}:{hash(ir.tokens)}"
+    token_key = ",".join(str(t) for t in ir.tokens)
+    return f"{backend_name}:{token_key}"
 
 
 def _operator_arity(token: int) -> int | None:

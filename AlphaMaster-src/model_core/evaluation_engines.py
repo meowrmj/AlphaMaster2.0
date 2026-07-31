@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import torch
 
-from .formula_ir import FormulaCompiler, FormulaIR, FormulaPlan
+from .formula_ir import FormulaCompiler, FormulaIR, FormulaPlan, annotate_support
 
 
 EvalFn = Callable[
@@ -39,6 +39,9 @@ class EvalGuardReport:
 class FormulaEvaluator:
     name = "base"
 
+    def supports(self, ir: FormulaIR) -> bool:
+        return ir.valid
+
     def evaluate(
         self,
         formulas: list[list[int]],
@@ -50,6 +53,18 @@ class FormulaEvaluator:
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    def evaluate_plan(
+        self,
+        plan: FormulaPlan,
+        feat: torch.Tensor,
+        t_ret: torch.Tensor,
+        folds: list[dict],
+        use_wf: bool,
+        factor_pool_snapshot: list,
+    ) -> list[dict[str, Any]]:
+        formulas = [list(f) for f in plan.formulas]
+        return self.evaluate(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+
 
 class StandardFormulaEvaluator(FormulaEvaluator):
     """Reference path: evaluate formulas one by one with the scalar VM."""
@@ -58,6 +73,9 @@ class StandardFormulaEvaluator(FormulaEvaluator):
 
     def __init__(self, scalar_eval: EvalFn):
         self.scalar_eval = scalar_eval
+
+    def supports(self, ir: FormulaIR) -> bool:
+        return True
 
     def evaluate(
         self,
@@ -85,9 +103,11 @@ class FastBatchFormulaEvaluator(FormulaEvaluator):
 
     def __init__(self, batch_eval: BatchEvalFn):
         self.batch_eval = batch_eval
-        self.compiler = FormulaCompiler()
         self.last_plan: FormulaPlan | None = None
         self.last_invalid: list[FormulaIR] = []
+
+    def supports(self, ir: FormulaIR) -> bool:
+        return ir.valid
 
     def evaluate(
         self,
@@ -98,12 +118,20 @@ class FastBatchFormulaEvaluator(FormulaEvaluator):
         use_wf: bool,
         factor_pool_snapshot: list,
     ) -> list[dict[str, Any]]:
-        # Compile only structural metadata here. The existing batch evaluator
-        # remains authoritative for numerical semantics until a fused backend
-        # is explicitly registered.
-        self.last_plan = self.compiler.compile_batch(formulas)
-        self.last_invalid = [ir for ir in self.last_plan.irs if not ir.valid]
         return self.batch_eval(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+
+    def evaluate_plan(
+        self,
+        plan: FormulaPlan,
+        feat: torch.Tensor,
+        t_ret: torch.Tensor,
+        folds: list[dict],
+        use_wf: bool,
+        factor_pool_snapshot: list,
+    ) -> list[dict[str, Any]]:
+        self.last_plan = plan
+        self.last_invalid = [ir for ir in plan.irs if not ir.valid]
+        return self.evaluate([list(f) for f in plan.formulas], feat, t_ret, folds, use_wf, factor_pool_snapshot)
 
 
 class ScoreGuard:
@@ -207,6 +235,10 @@ class EvaluatorRouter:
         self.mode = (mode or "auto").strip().lower()
         self.last_engine = "standard"
         self.last_guard_report = EvalGuardReport()
+        self.compiler = FormulaCompiler()
+        self.last_plan: FormulaPlan | None = None
+        self.last_fast_coverage = 0.0
+        self.last_invalid_count = 0
 
     def evaluate(
         self,
@@ -220,17 +252,28 @@ class EvaluatorRouter:
         factor_pool_snapshot: list,
         prefer_fast: bool,
     ) -> list[dict[str, Any]]:
+        plan = self.compiler.compile_batch(formulas)
+        plan = annotate_support(plan, [self.fast, self.standard])
+        self.last_plan = plan
+        self.last_fast_coverage = plan.coverage(self.fast.name)
+        self.last_invalid_count = plan.invalid_count
+
         if self.mode == "standard" or not prefer_fast:
             self.last_engine = self.standard.name
-            return self.standard.evaluate(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+            return self.standard.evaluate_plan(plan, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+
+        fast_supported = self.last_fast_coverage >= 1.0
+        if not fast_supported:
+            self.last_engine = f"{self.fast.name}->standard_unsupported_fallback"
+            return self.standard.evaluate_plan(plan, feat, t_ret, folds, use_wf, factor_pool_snapshot)
 
         try:
-            results = self.fast.evaluate(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+            results = self.fast.evaluate_plan(plan, feat, t_ret, folds, use_wf, factor_pool_snapshot)
         except Exception:
             if self.mode == "strict_fast":
                 raise
             self.last_engine = f"{self.fast.name}->standard_error_fallback"
-            return self.standard.evaluate(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+            return self.standard.evaluate_plan(plan, feat, t_ret, folds, use_wf, factor_pool_snapshot)
 
         self.last_engine = self.fast.name
         if self.guard is not None:
@@ -249,7 +292,7 @@ class EvaluatorRouter:
                 if self.mode == "strict_fast":
                     raise RuntimeError(f"formula evaluation guard failed: {report.reason}")
                 self.last_engine = f"{self.fast.name}->standard_guard_fallback"
-                return self.standard.evaluate(formulas, feat, t_ret, folds, use_wf, factor_pool_snapshot)
+                return self.standard.evaluate_plan(plan, feat, t_ret, folds, use_wf, factor_pool_snapshot)
         return results
 
 
