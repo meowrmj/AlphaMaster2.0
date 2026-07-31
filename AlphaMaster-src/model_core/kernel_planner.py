@@ -92,6 +92,28 @@ class KernelExecutionPlan:
     def top_buckets(self, limit: int = 10) -> list[KernelBucket]:
         return sorted(self.buckets, key=lambda b: (b.size, b.op_name), reverse=True)[:limit]
 
+    def summary(self, top: int = 8) -> dict:
+        return {
+            "valid_count": self.valid_count,
+            "invalid_count": self.invalid_count,
+            "token_steps": self.token_steps,
+            "naive_launches": self.naive_launches,
+            "bucketed_launches": self.bucketed_launches,
+            "launch_reduction": self.launch_reduction,
+            "supported_bucketed_launches": self.supported_bucketed_launches,
+            "unsupported_bucketed_launches": self.unsupported_bucketed_launches,
+            "top_buckets": [
+                {
+                    "stage": b.stage,
+                    "family": b.family.value,
+                    "op_name": b.op_name,
+                    "arity": b.arity,
+                    "size": b.size,
+                }
+                for b in self.top_buckets(top)
+            ],
+        }
+
 
 class KernelPlanCache:
     """Small LRU cache for repeated formula batches."""
