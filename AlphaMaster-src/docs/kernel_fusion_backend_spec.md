@@ -66,6 +66,53 @@ MSVC cl.exe not found
 
 工具链缺失时会安全跳过；工具链完整时会编译扩展并对齐 PyTorch 的 `ADD/SUB/MUL/DIV/IF_GT/GATE`。
 
+## 当前 native 第一批覆盖
+
+第一批 C++/CUDA native kernel 覆盖低风险算子：
+
+```text
+一元：
+NEG / ABS / SIGN / POWER / SIGNED_POWER_2 / SIGNED_LOG / SQRT / CLIP / SIGMOID / TANH_SQUASH
+
+二元：
+ADD / SUB / MUL / DIV / MAX / MIN
+
+三元：
+IF_GT / GATE
+```
+
+在最近 192 条真实公式上的 dry-run 覆盖：
+
+```text
+bucketed launches = 185
+native elementwise executable = 54
+fallback = 131
+```
+
+剩余 fallback 主要来自：
+
+```text
+rolling = 99
+shift = 18
+cross_sectional = 8
+elementwise = 3
+branch = 3
+```
+
+结论：第一批 native elementwise/branch 只能验证自定义 kernel 链路，不能单独带来整轮大幅提速。真正接近朋友那种速度，第二批必须做 rolling/shift fused kernel，尤其是：
+
+```text
+TS_ZSCORE_10/20
+TS_MEAN_5/10/20
+TS_SUM_10/20
+TS_RANK_5/10/20
+EMA_20
+DECAY
+WINSORIZE
+DELAY1/DELAY4
+MOMENTUM_5/10
+```
+
 ## 输入输出
 
 输入：

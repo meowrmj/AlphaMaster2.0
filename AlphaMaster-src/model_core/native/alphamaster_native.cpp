@@ -2,6 +2,12 @@
 
 torch::Tensor elementwise2_cuda(torch::Tensor a, torch::Tensor b, int64_t op_id);
 torch::Tensor elementwise3_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c, int64_t op_id);
+torch::Tensor elementwise1_cuda(torch::Tensor a, int64_t op_id);
+
+torch::Tensor elementwise1(torch::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
+  return elementwise1_cuda(a.contiguous(), op_id);
+}
 
 torch::Tensor elementwise2(torch::Tensor a, torch::Tensor b, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
@@ -19,6 +25,7 @@ torch::Tensor elementwise3(torch::Tensor a, torch::Tensor b, torch::Tensor c, in
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("elementwise1", &elementwise1, "AlphaMaster elementwise unary CUDA ops");
   m.def("elementwise2", &elementwise2, "AlphaMaster elementwise binary CUDA ops");
   m.def("elementwise3", &elementwise3, "AlphaMaster elementwise ternary CUDA ops");
 }

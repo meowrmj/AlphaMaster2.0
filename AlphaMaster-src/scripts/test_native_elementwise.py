@@ -25,6 +25,16 @@ def main() -> None:
     c = torch.randn_like(a)
 
     checks = [
+        ("NEG", native.apply("NEG", a), -a),
+        ("ABS", native.apply("ABS", a), torch.abs(a)),
+        ("SIGN", native.apply("SIGN", a), torch.sign(a)),
+        ("POWER", native.apply("POWER", a), torch.sign(a) * torch.abs(a).pow(2.0)),
+        ("SIGNED_POWER_2", native.apply("SIGNED_POWER_2", a), torch.sign(a) * torch.abs(a).pow(2.0)),
+        ("SIGNED_LOG", native.apply("SIGNED_LOG", a), torch.sign(a) * torch.log1p(torch.abs(a))),
+        ("SQRT", native.apply("SQRT", a), torch.sign(a) * torch.sqrt(torch.abs(a))),
+        ("CLIP", native.apply("CLIP", a), torch.clamp(a, -3.0, 3.0)),
+        ("SIGMOID", native.apply("SIGMOID", a), 2 * torch.sigmoid(a) - 1),
+        ("TANH_SQUASH", native.apply("TANH_SQUASH", a), torch.tanh(a)),
         ("ADD", native.apply("ADD", a, b), a + b),
         ("SUB", native.apply("SUB", a, b), a - b),
         ("MUL", native.apply("MUL", a, b), a * b),

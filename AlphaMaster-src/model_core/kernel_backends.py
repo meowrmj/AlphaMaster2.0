@@ -12,6 +12,7 @@ from typing import Protocol
 import torch
 
 from .kernel_planner import KernelExecutionPlan, KernelFamily
+from .native_backend import NativeElementwiseOps
 
 
 @dataclass(frozen=True)
@@ -89,3 +90,38 @@ class DryRunKernelBackend:
         feat_tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("DryRunKernelBackend only analyzes plans; it never executes formulas")
+
+
+class NativeElementwiseDryRunBackend(DryRunKernelBackend):
+    """Dry-run coverage for the first C++/CUDA native kernel batch."""
+
+    name = "native_elementwise_dry_run"
+
+    def __init__(self):
+        super().__init__(families={KernelFamily.ELEMENTWISE, KernelFamily.BRANCH})
+
+    def analyze(self, plan: KernelExecutionPlan) -> KernelBackendReport:
+        executable = 0
+        fallback_ops = Counter()
+        fallback_families = Counter()
+        for bucket in plan.buckets:
+            can_execute = (
+                bucket.family in {KernelFamily.ELEMENTWISE, KernelFamily.BRANCH}
+                and NativeElementwiseOps.supports(bucket.op_name, bucket.arity)
+            )
+            if can_execute:
+                executable += 1
+            else:
+                fallback_ops[bucket.op_name] += 1
+                fallback_families[bucket.family.value] += 1
+        fallback = plan.bucketed_launches - executable
+        return KernelBackendReport(
+            backend=self.name,
+            executable=(fallback == 0 and plan.invalid_count == 0),
+            reason="" if fallback == 0 else f"{fallback} buckets need fallback",
+            planned_launches=plan.bucketed_launches,
+            executable_launches=executable,
+            fallback_launches=fallback,
+            fallback_ops=tuple(fallback_ops.most_common()),
+            fallback_families=tuple(fallback_families.most_common()),
+        )

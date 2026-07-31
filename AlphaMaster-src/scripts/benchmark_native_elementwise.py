@@ -33,7 +33,15 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=192)
     parser.add_argument("--symbols", type=int, default=1)
     parser.add_argument("--bars", type=int, default=5555)
-    parser.add_argument("--op", default="ADD", choices=["ADD", "SUB", "MUL", "DIV", "MAX", "MIN", "IF_GT", "GATE"])
+    parser.add_argument(
+        "--op",
+        default="ADD",
+        choices=[
+            "NEG", "ABS", "SIGN", "POWER", "SIGNED_POWER_2", "SIGNED_LOG", "SQRT",
+            "CLIP", "SIGMOID", "TANH_SQUASH",
+            "ADD", "SUB", "MUL", "DIV", "MAX", "MIN", "IF_GT", "GATE",
+        ],
+    )
     args = parser.parse_args()
 
     status = probe_native_build()
@@ -48,7 +56,37 @@ def main() -> None:
     b = torch.randn(shape, device="cuda")
     c = torch.randn(shape, device="cuda")
 
-    if args.op == "ADD":
+    if args.op == "NEG":
+        torch_fn = lambda: -a
+        native_fn = lambda: native.apply("NEG", a)
+    elif args.op == "ABS":
+        torch_fn = lambda: torch.abs(a)
+        native_fn = lambda: native.apply("ABS", a)
+    elif args.op == "SIGN":
+        torch_fn = lambda: torch.sign(a)
+        native_fn = lambda: native.apply("SIGN", a)
+    elif args.op == "POWER":
+        torch_fn = lambda: torch.sign(a) * torch.abs(a).pow(2.0)
+        native_fn = lambda: native.apply("POWER", a)
+    elif args.op == "SIGNED_POWER_2":
+        torch_fn = lambda: torch.sign(a) * torch.abs(a).pow(2.0)
+        native_fn = lambda: native.apply("SIGNED_POWER_2", a)
+    elif args.op == "SIGNED_LOG":
+        torch_fn = lambda: torch.sign(a) * torch.log1p(torch.abs(a))
+        native_fn = lambda: native.apply("SIGNED_LOG", a)
+    elif args.op == "SQRT":
+        torch_fn = lambda: torch.sign(a) * torch.sqrt(torch.abs(a))
+        native_fn = lambda: native.apply("SQRT", a)
+    elif args.op == "CLIP":
+        torch_fn = lambda: torch.clamp(a, -3.0, 3.0)
+        native_fn = lambda: native.apply("CLIP", a)
+    elif args.op == "SIGMOID":
+        torch_fn = lambda: 2 * torch.sigmoid(a) - 1
+        native_fn = lambda: native.apply("SIGMOID", a)
+    elif args.op == "TANH_SQUASH":
+        torch_fn = lambda: torch.tanh(a)
+        native_fn = lambda: native.apply("TANH_SQUASH", a)
+    elif args.op == "ADD":
         torch_fn = lambda: a + b
         native_fn = lambda: native.apply("ADD", a, b)
     elif args.op == "SUB":

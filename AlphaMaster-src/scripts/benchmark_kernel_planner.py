@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model_core.kernel_planner import KernelPlanner
-from model_core.kernel_backends import DryRunKernelBackend
+from model_core.kernel_backends import DryRunKernelBackend, NativeElementwiseDryRunBackend
 from scripts.analyze_kernel_coverage import formulas_from_checkpoint
 
 
@@ -49,6 +49,7 @@ def main() -> None:
     cold_plan = cold_planner.plan(formulas)
     cold_ms = (time.perf_counter() - t0) * 1000.0
     backend_report = DryRunKernelBackend().analyze(cold_plan)
+    native_report = NativeElementwiseDryRunBackend().analyze(cold_plan)
 
     hot_planner = KernelPlanner(cache_size=16)
     hot_planner.plan(formulas)
@@ -75,6 +76,13 @@ def main() -> None:
     )
     print(f"fallback_ops={backend_report.fallback_ops[:12]}")
     print(f"fallback_families={backend_report.fallback_families}")
+    print(
+        f"native_elementwise planned={native_report.planned_launches} "
+        f"executable_launches={native_report.executable_launches} "
+        f"fallback_launches={native_report.fallback_launches} "
+        f"fallback_families={native_report.fallback_families}"
+    )
+    print(f"native_elementwise_fallback_ops={native_report.fallback_ops[:12]}")
     print(
         f"hot_plan_ms avg={statistics.mean(hot_times):.6f} "
         f"p50={statistics.median(hot_times):.6f} "
