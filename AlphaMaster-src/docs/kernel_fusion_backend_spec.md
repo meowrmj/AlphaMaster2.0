@@ -33,6 +33,39 @@ formulas + features -> factors + valid_mask
 
 这些继续走原逻辑。
 
+## Windows C++/CUDA 工具链要求
+
+硬路线使用 PyTorch C++/CUDA Extension，需要本机同时具备：
+
+```text
+CUDA Toolkit：提供 nvcc
+Microsoft Visual Studio Build Tools：提供 cl.exe
+PyTorch CUDA 版本：当前为 cu128
+```
+
+当前探针命令：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\probe_native_backend.py
+```
+
+如果输出：
+
+```text
+CUDA Toolkit/nvcc not found
+MSVC cl.exe not found
+```
+
+说明只能运行 CUDA 版 PyTorch，还不能编译自定义 CUDA kernel。
+
+最小 native 数值测试：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\test_native_elementwise.py
+```
+
+工具链缺失时会安全跳过；工具链完整时会编译扩展并对齐 PyTorch 的 `ADD/SUB/MUL/DIV/IF_GT/GATE`。
+
 ## 输入输出
 
 输入：
