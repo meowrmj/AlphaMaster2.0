@@ -1891,6 +1891,7 @@ function updateEvalModeApplyState(training) {
 
 function restoreControlsFromTrainingJob(job) {
   if (!job) return;
+  replayPolicyDraftDirty = false;
   const alg = job.algorithm_mode || "rl";
   const mode = job.eval_mode || "cpu_batch";
   const replay = normalizeReplayConfig(job.replay_config || { modules: { qd: true, incubation: true } });
@@ -1916,7 +1917,7 @@ function restoreControlsFromTrainingJob(job) {
 }
 
 function syncRunningTrainingControls(job) {
-  if (!job || trainingModeApplyInFlight || trainingStartPending) return;
+  if (!job || trainingModeApplyInFlight || trainingStartPending || replayPolicyDraftDirty) return;
   const alg = job.algorithm_mode || "rl";
   const mode = job.eval_mode || "cpu_batch";
   const algSelect = $("algorithmModeSelect");
