@@ -10,7 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model_core.native_backend import BITWISE_EXACT_NATIVE_OPS, NativeElementwiseOps, probe_native_build
+from model_core.native_backend import NativeElementwiseOps, probe_native_build
 from model_core.batch_ops import BATCH_OPS_CONFIG
 
 
@@ -97,8 +97,7 @@ def main() -> None:
         expected = torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)
         diff = (got - expected).abs().max().item()
         print(name, "max_diff", diff)
-        if name in BITWISE_EXACT_NATIVE_OPS:
-            assert torch.equal(got, expected), (name, diff)
+        assert diff <= 1e-5, (name, diff)
     for name in ("TS_ZSCORE_10", "TS_ZSCORE_20"):
         got = native.apply(name, flat)
         expected = _batch_op(name)(flat)

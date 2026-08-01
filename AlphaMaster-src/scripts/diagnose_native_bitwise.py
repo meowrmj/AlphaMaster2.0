@@ -46,6 +46,17 @@ def _first_diff(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float, float]:
     return flat_idx, float(a.reshape(-1)[flat_idx].item()), float(b.reshape(-1)[flat_idx].item())
 
 
+def _max_diff(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float, float, float]:
+    diff = (a - b).abs()
+    flat_idx = int(diff.reshape(-1).argmax().item())
+    return (
+        flat_idx,
+        float(a.reshape(-1)[flat_idx].item()),
+        float(b.reshape(-1)[flat_idx].item()),
+        float(diff.reshape(-1)[flat_idx].item()),
+    )
+
+
 def _run_trace(
     formula: torch.Tensor,
     feat: torch.Tensor,
@@ -99,6 +110,7 @@ def main() -> None:
     parser.add_argument("--length", type=int, default=8)
     parser.add_argument("--formula-index", type=int)
     parser.add_argument("--op")
+    parser.add_argument("--tol", type=float, default=0.0)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -121,20 +133,21 @@ def main() -> None:
             print("formula:", " -> ".join(_formula_names(formula)))
             raise SystemExit(1)
         for step, (ref, got) in enumerate(zip(torch_trace, native_trace)):
-            if not torch.equal(ref.value, got.value):
+            diff = (ref.value - got.value).abs().max().item()
+            if not torch.equal(ref.value, got.value) and diff > args.tol:
                 torch.cuda.synchronize()
                 flat_idx, ref_v, got_v = _first_diff(ref.value, got.value)
-                diff = (ref.value - got.value).abs().max().item()
+                max_idx, max_ref_v, max_got_v, max_diff = _max_diff(ref.value, got.value)
                 print("BITWISE_MISMATCH")
                 print(f"formula_index={formula_idx}")
                 print("formula:", " -> ".join(_formula_names(formula)))
                 print(f"step={step} op={ref.name} max_abs_diff={diff}")
                 print(f"first_flat_index={flat_idx} torch={ref_v!r} native={got_v!r}")
+                print(f"max_flat_index={max_idx} torch={max_ref_v!r} native={max_got_v!r} diff={max_diff!r}")
                 print(f"shape={tuple(ref.value.shape)} symbols={args.symbols} bars={args.bars}")
-                if ref.inputs:
-                    input_tensor = ref.inputs[0]
+                for input_idx, input_tensor in enumerate(ref.inputs):
                     _, sym, bar = torch.unravel_index(
-                        torch.tensor(flat_idx, device=input_tensor.device),
+                        torch.tensor(max_idx, device=input_tensor.device),
                         ref.value.shape,
                     )
                     sym_i = int(sym.item())
@@ -142,7 +155,7 @@ def main() -> None:
                     start = max(0, bar_i - 6)
                     end = min(input_tensor.shape[-1], bar_i + 2)
                     window = input_tensor[0, sym_i, start:end].detach().cpu().tolist()
-                    print(f"input_window bars[{start}:{end}]={window!r}")
+                    print(f"input{input_idx}_window bars[{start}:{end}]={window!r}")
                 raise SystemExit(1)
 
         os.environ["ALPHAMASTER_NATIVE_FORMULA_OPS"] = "0"

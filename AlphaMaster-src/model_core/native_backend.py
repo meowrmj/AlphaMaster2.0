@@ -94,40 +94,15 @@ NATIVE_CROSS_SECTIONAL_OPS = {
     "CS_NEUTRALIZE": 3030,
 }
 
-BITWISE_EXACT_NATIVE_OPS = {
-    "NEG",
-    "ABS",
-    "SIGN",
-    "POWER",
-    "SIGNED_POWER_2",
-    "SIGNED_LOG",
-    "SQRT",
-    "CLIP",
-    "SIGMOID",
-    "TANH_SQUASH",
-    "ADD",
-    "SUB",
-    "MUL",
-    "DIV",
-    "MAX",
-    "MIN",
-    "IF_GT",
-    "GATE",
-    "DELAY1",
-    "DELAY4",
-    "DELTA",
-    "DELTA_5",
-    "WMA",
-    "TS_MIN_10",
-    "TS_MIN_20",
-    "TS_MAX_10",
-    "TS_MAX_20",
-    "TS_ARG_MAX_5",
-    "TS_ARG_MIN_5",
-    "TS_RANK_5",
-    "MAX3",
-    "CS_SCALE",
-}
+NUMERICALLY_STABLE_NATIVE_OPS = (
+    set(NATIVE_BINARY_OPS)
+    | set(NATIVE_ROLLING_BINARY_OPS)
+    | set(NATIVE_UNARY_OPS)
+    | set(NATIVE_TERNARY_OPS)
+    | set(NATIVE_SHIFT_OPS)
+    | set(NATIVE_ROLLING_OPS)
+    | set(NATIVE_CROSS_SECTIONAL_OPS)
+)
 
 
 @dataclass(frozen=True)
@@ -201,10 +176,13 @@ class NativeElementwiseOps:
 
     def __init__(self, ext=None, verbose: bool = False):
         self.ext = ext if ext is not None else load_native_extension(verbose=verbose)
+        disabled = os.getenv("ALPHAMASTER_NATIVE_DISABLED_OPS", "DECAY,MOMENTUM_10")
+        self.disabled_ops = {op.strip().upper() for op in disabled.split(",") if op.strip()}
 
-    @staticmethod
-    def supports(op_name: str, arity: int) -> bool:
-        if op_name not in BITWISE_EXACT_NATIVE_OPS:
+    def supports(self, op_name: str, arity: int) -> bool:
+        if op_name in self.disabled_ops:
+            return False
+        if op_name not in NUMERICALLY_STABLE_NATIVE_OPS:
             return False
         if arity == 1:
             return (

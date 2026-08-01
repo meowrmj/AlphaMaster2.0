@@ -28,6 +28,8 @@ def _select_device() -> torch.device:
 
 
 class ModelConfig:
+    ALGORITHM_MODE: str = os.getenv("ALPHAMASTER_ALGORITHM_MODE", "rl").strip().lower()
+
     # ── 训练设备 ─────────────────────────────────────────────────────────
     # 注意：本任务 CPU 训练速度反而比 GPU 快（实测约 2.3 倍），故强制用 CPU。
     # 原因：
@@ -47,6 +49,12 @@ class ModelConfig:
     DEVICE = _select_device()
     GPU_BATCH_EVAL: bool = _env_bool("ALPHAMASTER_GPU_BATCH_EVAL", False)
     GPU_BATCH_EVAL_STRICT: bool = _env_bool("ALPHAMASTER_GPU_BATCH_EVAL_STRICT", True)
+    EVALUATOR_ENGINE: str = os.getenv("ALPHAMASTER_EVALUATOR_ENGINE", "auto").strip().lower()
+    EVALUATOR_GUARD: bool = _env_bool("ALPHAMASTER_EVALUATOR_GUARD", True)
+    EVALUATOR_GUARD_EVERY: int = int(os.getenv("ALPHAMASTER_EVALUATOR_GUARD_EVERY", "1"))
+    EVALUATOR_GUARD_SAMPLE: int = int(os.getenv("ALPHAMASTER_EVALUATOR_GUARD_SAMPLE", "8"))
+    EVALUATOR_SCORE_TOL: float = float(os.getenv("ALPHAMASTER_EVALUATOR_SCORE_TOL", "3e-3"))
+    EVALUATOR_FACTOR_TOL: float = float(os.getenv("ALPHAMASTER_EVALUATOR_FACTOR_TOL", "2.5e-1"))
 
     # ── 训练参数（大搜索空间适配版，2026-07-04 重构）─────────────────────
     # 背景：特征库扩展到 65、算子库扩展到 66（vocab=131），8-token 搜索空间
@@ -102,8 +110,35 @@ class ModelConfig:
 
     # ── Elite Replay ──────────────────────────────────────────────────
     ELITE_REPLAY_FRAC:  float = 0.25
+    REPLAY_POLICY:      str   = os.getenv("ALPHAMASTER_REPLAY_POLICY", "qd_incubation")
     ELITE_POOL_SIZE:    int   = 60    # 30→60：大空间需要更大的精英记忆
-    ELITE_REWARD_SCALE: float = 1.2
+    ELITE_REWARD_SCALE: float = 0.4
+    ELITE_BUCKET_CAP:   int   = 3
+    ELITE_REPLAY_COOLDOWN_STEPS: int = 80
+    ELITE_REPLAY_RECOVERY_STEPS: int = 120
+
+    # 重启后的“新方向孵化池”：保护冷却期产生的新公式，避免还没成熟就被历史高分精英挤掉。
+    INCUBATION_POOL_SIZE: int = 36
+    INCUBATION_BUCKET_CAP: int = 2
+    INCUBATION_CAPTURE_STEPS: int = 180
+    INCUBATION_REPLAY_STEPS: int = 260
+    INCUBATION_REPLAY_FRAC: float = 0.08
+    INCUBATION_MIN_SCORE: float = -0.5
+
+    # Optional search plugins. They propose extra formulas for evaluation, but
+    # V1 keeps them out of REINFORCE gradients so they do not pull the generator.
+    SEARCH_PLUGIN_FRAC: float = float(os.getenv("ALPHAMASTER_SEARCH_PLUGIN_FRAC", "0.20"))
+    SEARCH_ARCHIVE_SIZE: int = int(os.getenv("ALPHAMASTER_SEARCH_ARCHIVE_SIZE", "96"))
+    SEARCH_BUCKET_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_BUCKET_CAP", "4"))
+    ANNEAL_TEMP: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP", "0.35"))
+    ANNEAL_TEMP_MIN: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP_MIN", "0.03"))
+    ANNEAL_DECAY: float = float(os.getenv("ALPHAMASTER_ANNEAL_DECAY", "0.997"))
+    GA_MUTATION_RATE: float = float(os.getenv("ALPHAMASTER_GA_MUTATION_RATE", "0.45"))
+    GA_TOURNAMENT_K: int = int(os.getenv("ALPHAMASTER_GA_TOURNAMENT_K", "4"))
+    GA_POPULATION_SIZE: int = int(os.getenv("ALPHAMASTER_GA_POPULATION_SIZE", "384"))
+    GA_ELITE_FRAC: float = float(os.getenv("ALPHAMASTER_GA_ELITE_FRAC", "0.06"))
+    GA_RANDOM_INJECT_FRAC: float = float(os.getenv("ALPHAMASTER_GA_RANDOM_INJECT_FRAC", "0.08"))
+    GA_CROSSOVER_RATE: float = float(os.getenv("ALPHAMASTER_GA_CROSSOVER_RATE", "0.70"))
 
     # ── 坍塌重启（大空间加强版）─────────────────────────────────────────
     # MAX_RESTARTS 8→25→55、RESTART_NOISE 0.05→0.1→0.25：时间不敏感，多给机会+更强扰动。
