@@ -323,6 +323,67 @@ class NativeElementwiseOps:
             return op_name in NATIVE_TERNARY_OPS
         return False
 
+    def supports_shift_unary(self, shift_op_name: str, unary_op_name: str) -> bool:
+        if os.getenv("ALPHAMASTER_NATIVE_FUSED_SHIFT_UNARY", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        return (
+            shift_op_name in NATIVE_SHIFT_OPS
+            and unary_op_name in NATIVE_UNARY_OPS
+            and self.supports(shift_op_name, 1)
+            and self.supports(unary_op_name, 1)
+            and hasattr(self.ext, "fused_shift_unary")
+        )
+
+    def apply_shift_unary(self, shift_op_name: str, unary_op_name: str, arg: torch.Tensor) -> torch.Tensor:
+        if not self.supports_shift_unary(shift_op_name, unary_op_name):
+            raise NotImplementedError(f"native fused shift+unary not supported: {shift_op_name}->{unary_op_name}")
+        return self.ext.fused_shift_unary(
+            arg,
+            NATIVE_SHIFT_OPS[shift_op_name],
+            NATIVE_UNARY_OPS[unary_op_name],
+        )
+
+    def supports_binary_branch(self, binary_op_name: str, branch_op_name: str) -> bool:
+        if os.getenv("ALPHAMASTER_NATIVE_FUSED_BINARY_BRANCH", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        return (
+            binary_op_name in NATIVE_BINARY_OPS
+            and branch_op_name in NATIVE_TERNARY_OPS
+            and self.supports(binary_op_name, 2)
+            and self.supports(branch_op_name, 3)
+            and hasattr(self.ext, "fused_binary_branch")
+        )
+
+    def apply_binary_branch(
+        self,
+        binary_op_name: str,
+        branch_op_name: str,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        branch_condition: torch.Tensor,
+        branch_true_value: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.supports_binary_branch(binary_op_name, branch_op_name):
+            raise NotImplementedError(f"native fused binary+branch not supported: {binary_op_name}->{branch_op_name}")
+        return self.ext.fused_binary_branch(
+            lhs,
+            rhs,
+            branch_condition,
+            branch_true_value,
+            NATIVE_BINARY_OPS[binary_op_name],
+            NATIVE_TERNARY_OPS[branch_op_name],
+        )
+
     def apply(self, op_name: str, *args: torch.Tensor) -> torch.Tensor:
         arity = len(args)
         if arity == 1 and op_name in NATIVE_UNARY_OPS:

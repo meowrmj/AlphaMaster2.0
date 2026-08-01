@@ -116,11 +116,14 @@ class BatchStackVM3D:
         )
         ptr = torch.zeros(bsz, dtype=torch.long, device=feat_tensor.device)
         valid = torch.ones(bsz, dtype=torch.bool, device=feat_tensor.device)
+        skip_next = torch.zeros(bsz, dtype=torch.bool, device=feat_tensor.device)
         feat_bank = feat_tensor.permute(1, 0, 2)
 
         for step in range(max_len):
             tok = formulas[:, step]
-            active = valid
+            stage_skip = skip_next
+            skip_next = torch.zeros_like(skip_next)
+            active = valid & ~stage_skip
 
             feat_mask = active & (tok < self.feat_offset)
             if feat_mask.any():
@@ -153,8 +156,92 @@ class BatchStackVM3D:
 
                     op_name = self.op_name_map[op_tok]
                     native = self._native(feat_tensor.device)
-                    native_supported = native is not None and native.supports(op_name, arity)
                     base = ptr[idx] - arity
+
+                    if arity == 1 and native is not None and step + 1 < max_len:
+                        next_tok = formulas[idx, step + 1]
+                        next_op_mask = next_tok >= self.feat_offset
+                        if next_op_mask.any():
+                            fused_handled = torch.zeros(idx.shape, dtype=torch.bool, device=idx.device)
+                            for next_op_tok_t in torch.unique(next_tok[next_op_mask]):
+                                next_op_tok = int(next_op_tok_t.item())
+                                if next_op_tok not in self.op_map or self.arity_map[next_op_tok] != 1:
+                                    continue
+                                next_op_name = self.op_name_map[next_op_tok]
+                                if not native.supports_shift_unary(op_name, next_op_name):
+                                    continue
+                                sub_mask = next_tok == next_op_tok_t
+                                idx_fused = idx[sub_mask]
+                                base_fused = base[sub_mask]
+                                try:
+                                    res = native.apply_shift_unary(
+                                        op_name,
+                                        next_op_name,
+                                        stack[idx_fused, base_fused, :, :],
+                                    )
+                                except Exception as exc:
+                                    raise RuntimeError(
+                                        f"native fused formula op failed: {op_name}->{next_op_name}"
+                                    ) from exc
+                                if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                    valid[idx_fused] = False
+                                    continue
+                                res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                                stack[idx_fused, base_fused, :, :] = res
+                                ptr[idx_fused] = base_fused + 1
+                                skip_next[idx_fused] = True
+                                fused_handled |= sub_mask
+                            if fused_handled.any():
+                                idx = idx[~fused_handled]
+                                if idx.numel() == 0:
+                                    continue
+                                base = ptr[idx] - arity
+
+                    if arity == 2 and native is not None and step + 1 < max_len:
+                        next_tok = formulas[idx, step + 1]
+                        next_op_mask = next_tok >= self.feat_offset
+                        branch_ready = ptr[idx] >= 4
+                        if next_op_mask.any() and branch_ready.any():
+                            fused_handled = torch.zeros(idx.shape, dtype=torch.bool, device=idx.device)
+                            for next_op_tok_t in torch.unique(next_tok[next_op_mask & branch_ready]):
+                                next_op_tok = int(next_op_tok_t.item())
+                                if next_op_tok not in self.op_map or self.arity_map[next_op_tok] != 3:
+                                    continue
+                                next_op_name = self.op_name_map[next_op_tok]
+                                if not native.supports_binary_branch(op_name, next_op_name):
+                                    continue
+                                sub_mask = (next_tok == next_op_tok_t) & branch_ready
+                                idx_fused = idx[sub_mask]
+                                bin_base = ptr[idx_fused] - 2
+                                branch_base = ptr[idx_fused] - 4
+                                try:
+                                    res = native.apply_binary_branch(
+                                        op_name,
+                                        next_op_name,
+                                        stack[idx_fused, bin_base, :, :],
+                                        stack[idx_fused, bin_base + 1, :, :],
+                                        stack[idx_fused, branch_base, :, :],
+                                        stack[idx_fused, branch_base + 1, :, :],
+                                    )
+                                except Exception as exc:
+                                    raise RuntimeError(
+                                        f"native fused formula op failed: {op_name}->{next_op_name}"
+                                    ) from exc
+                                if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                    valid[idx_fused] = False
+                                    continue
+                                res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                                stack[idx_fused, branch_base, :, :] = res
+                                ptr[idx_fused] = branch_base + 1
+                                skip_next[idx_fused] = True
+                                fused_handled |= sub_mask
+                            if fused_handled.any():
+                                idx = idx[~fused_handled]
+                                if idx.numel() == 0:
+                                    continue
+                                base = ptr[idx] - arity
+
+                    native_supported = native is not None and native.supports(op_name, arity)
                     args = [stack[idx, base + off, :, :] for off in range(arity)]
                     try:
                         res = self._apply_op(

@@ -80,16 +80,7 @@ __device__ __forceinline__ float mul_rn(float a, float b) {
 }
 
 template <typename scalar_t>
-__global__ void elementwise1_kernel(
-    const scalar_t* __restrict__ a,
-    scalar_t* __restrict__ out,
-    int64_t n,
-    int64_t op_id) {
-  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) {
-    return;
-  }
-  scalar_t av = a[i];
+__device__ __forceinline__ scalar_t apply_unary_op(scalar_t av, int64_t op_id) {
   scalar_t v = static_cast<scalar_t>(0);
   if (op_id == OP_NEG) {
     v = -av;
@@ -117,7 +108,55 @@ __global__ void elementwise1_kernel(
   } else if (op_id == OP_TANH_SQUASH) {
     v = tanh(av);
   }
-  out[i] = sanitize(v);
+  return sanitize(v);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t apply_binary_op(scalar_t av, scalar_t bv, int64_t op_id) {
+  scalar_t v = static_cast<scalar_t>(0);
+  if (op_id == OP_ADD) {
+    v = av + bv;
+  } else if (op_id == OP_SUB) {
+    v = av - bv;
+  } else if (op_id == OP_MUL) {
+    v = av * bv;
+  } else if (op_id == OP_DIV) {
+    v = av / (bv + static_cast<scalar_t>(1e-6));
+  } else if (op_id == OP_MAX) {
+    v = av > bv ? av : bv;
+  } else if (op_id == OP_MIN) {
+    v = av < bv ? av : bv;
+  }
+  return sanitize(v);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t apply_branch_op(
+    scalar_t av,
+    scalar_t bv,
+    scalar_t cv,
+    int64_t op_id) {
+  scalar_t v = static_cast<scalar_t>(0);
+  if (op_id == OP_IF_GT) {
+    v = av > static_cast<scalar_t>(0) ? bv : cv;
+  } else if (op_id == OP_GATE) {
+    scalar_t mask = av > static_cast<scalar_t>(0) ? static_cast<scalar_t>(1) : static_cast<scalar_t>(0);
+    v = mask * bv + (static_cast<scalar_t>(1) - mask) * cv;
+  }
+  return sanitize(v);
+}
+
+template <typename scalar_t>
+__global__ void elementwise1_kernel(
+    const scalar_t* __restrict__ a,
+    scalar_t* __restrict__ out,
+    int64_t n,
+    int64_t op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  out[i] = apply_unary_op(a[i], op_id);
 }
 
 template <typename scalar_t>
@@ -133,21 +172,7 @@ __global__ void elementwise2_kernel(
   }
   scalar_t av = a[i];
   scalar_t bv = b[i];
-  scalar_t v = static_cast<scalar_t>(0);
-  if (op_id == OP_ADD) {
-    v = av + bv;
-  } else if (op_id == OP_SUB) {
-    v = av - bv;
-  } else if (op_id == OP_MUL) {
-    v = av * bv;
-  } else if (op_id == OP_DIV) {
-    v = av / (bv + static_cast<scalar_t>(1e-6));
-  } else if (op_id == OP_MAX) {
-    v = av > bv ? av : bv;
-  } else if (op_id == OP_MIN) {
-    v = av < bv ? av : bv;
-  }
-  out[i] = sanitize(v);
+  out[i] = apply_binary_op(av, bv, op_id);
 }
 
 __device__ __forceinline__ int window_for_op(int64_t op_id) {
@@ -239,6 +264,33 @@ __global__ void shift1_kernel(
     v = a[i] - shifted;
   }
   out[i] = sanitize(v);
+}
+
+template <typename scalar_t>
+__global__ void fused_shift_unary_kernel(
+    const scalar_t* __restrict__ a,
+    scalar_t* __restrict__ out,
+    int64_t bsz,
+    int64_t n_symbols,
+    int64_t n_bars,
+    int64_t shift_op_id,
+    int64_t unary_op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = bsz * n_symbols * n_bars;
+  if (i >= total) {
+    return;
+  }
+  int64_t t = i % n_bars;
+  int delay = 1;
+  if (shift_op_id == OP_DELAY4 || shift_op_id == OP_DELTA_5) {
+    delay = (shift_op_id == OP_DELAY4) ? 4 : 5;
+  }
+  scalar_t shifted = t >= delay ? a[i - delay] : static_cast<scalar_t>(0);
+  scalar_t v = shifted;
+  if (shift_op_id == OP_DELTA || shift_op_id == OP_DELTA_5) {
+    v = a[i] - shifted;
+  }
+  out[i] = apply_unary_op(sanitize(v), unary_op_id);
 }
 
 template <typename scalar_t>
@@ -567,14 +619,25 @@ __global__ void elementwise3_kernel(
   scalar_t av = a[i];
   scalar_t bv = b[i];
   scalar_t cv = c[i];
-  scalar_t v = static_cast<scalar_t>(0);
-  if (op_id == OP_IF_GT) {
-    v = av > static_cast<scalar_t>(0) ? bv : cv;
-  } else if (op_id == OP_GATE) {
-    scalar_t mask = av > static_cast<scalar_t>(0) ? static_cast<scalar_t>(1) : static_cast<scalar_t>(0);
-    v = mask * bv + (static_cast<scalar_t>(1) - mask) * cv;
+  out[i] = apply_branch_op(av, bv, cv, op_id);
+}
+
+template <typename scalar_t>
+__global__ void fused_binary_branch_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    const scalar_t* __restrict__ c,
+    const scalar_t* __restrict__ d,
+    scalar_t* __restrict__ out,
+    int64_t n,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
   }
-  out[i] = sanitize(v);
+  scalar_t binary_v = apply_binary_op(a[i], b[i], binary_op_id);
+  out[i] = apply_branch_op(c[i], d[i], binary_v, branch_op_id);
 }
 
 }  // namespace
@@ -627,6 +690,31 @@ at::Tensor elementwise3_cuda(at::Tensor a, at::Tensor b, at::Tensor c, int64_t o
   return out;
 }
 
+at::Tensor fused_binary_branch_cuda(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    at::Tensor d,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t n = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((n + threads - 1) / threads);
+  fused_binary_branch_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      c.data_ptr<float>(),
+      d.data_ptr<float>(),
+      out.data_ptr<float>(),
+      n,
+      binary_op_id,
+      branch_op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 at::Tensor shift1_cuda(at::Tensor a, int64_t op_id) {
   TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
   auto out = at::empty_like(a);
@@ -643,6 +731,27 @@ at::Tensor shift1_cuda(at::Tensor a, int64_t op_id) {
       n_symbols,
       n_bars,
       op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor fused_shift_unary_cuda(at::Tensor a, int64_t shift_op_id, int64_t unary_op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t bsz = a.size(0);
+  int64_t n_symbols = a.size(1);
+  int64_t n_bars = a.size(2);
+  int64_t total = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+  fused_shift_unary_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      shift_op_id,
+      unary_op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
