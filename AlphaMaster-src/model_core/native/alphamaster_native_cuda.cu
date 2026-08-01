@@ -58,6 +58,7 @@ constexpr int OP_EMA_5 = 1405;
 constexpr int OP_EMA_20 = 1420;
 constexpr int OP_MOMENTUM_5 = 1505;
 constexpr int OP_MOMENTUM_10 = 1510;
+constexpr int OP_MAX3 = 1603;
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t sanitize(scalar_t x) {
@@ -294,6 +295,11 @@ __global__ void rolling1_kernel(
       long_sum += value_at(a, base, t - (19 - k), n_bars);
     }
     out_v = short_sum / static_cast<scalar_t>(short_w) - long_sum / static_cast<scalar_t>(20);
+  } else if (op_id == OP_MAX3) {
+    scalar_t d1 = value_at(a, base, t - 1, n_bars);
+    scalar_t d2 = value_at(a, base, t - 2, n_bars);
+    out_v = cur > d1 ? cur : d1;
+    out_v = out_v > d2 ? out_v : d2;
   }
   out[i] = sanitize(out_v);
 }

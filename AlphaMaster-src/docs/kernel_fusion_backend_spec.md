@@ -82,6 +82,7 @@ TS_ARG_MAX_5 / TS_ARG_MIN_5
 DECAY / WMA / DECAY_LINEAR_5 / TS_DECAY_EXP_5
 EMA_5 / EMA_20
 MOMENTUM_5 / MOMENTUM_10
+MAX3
 ```
 
 ## 当前验证证据
@@ -110,9 +111,18 @@ TS_RANK_20:     native 约 10.15x
 EMA_20:         native 约 533.59x
 TS_DECAY_EXP_5: native 约 3.56x
 DECAY:          native 约 4.80x
+MAX3:           native 约 2.50x
 ```
 
 注意：这是单算子速度，不等于完整训练 step 速度。完整 step 还包括采样、精英/孵化策略、打分聚合、梯度更新等环节。
+
+已验证但暂不启用：
+
+```text
+SCALE: 数值正确，但当前 native 串行扫描实现比 PyTorch 慢。
+JUMP: 数值正确，但当前 native 串行扫描实现比 PyTorch 慢。
+PRODUCT_5: 当前 native 实现与 PyTorch 路径最大误差超过 1e-5，继续 fallback。
+```
 
 ## 当前真实公式覆盖
 
@@ -128,8 +138,8 @@ DECAY:          native 约 4.80x
 formulas = 192
 token_steps = 8
 bucketed launches = 185
-native executable launches = 155
-fallback launches = 30
+native executable launches = 158
+fallback launches = 27
 ```
 
 剩余 fallback 主要来自：
@@ -137,7 +147,6 @@ fallback launches = 30
 ```text
 WINSORIZE
 CS_RANK
-MAX3
 TS_CORR_10
 JUMP
 CS_SCALE

@@ -79,6 +79,7 @@ NATIVE_ROLLING_OPS = {
     "EMA_20": 1420,
     "MOMENTUM_5": 1505,
     "MOMENTUM_10": 1510,
+    "MAX3": 1603,
 }
 
 

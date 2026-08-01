@@ -58,6 +58,7 @@ def main() -> None:
             "TS_QUANTILE_10", "TS_ARG_MAX_5", "TS_ARG_MIN_5",
             "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
             "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
+            "MAX3",
         ],
     )
     args = parser.parse_args()
@@ -115,6 +116,7 @@ def main() -> None:
         "TS_QUANTILE_10", "TS_ARG_MAX_5", "TS_ARG_MIN_5",
         "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
         "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
+        "MAX3",
     }:
         torch_op = _batch_op(args.op)
         torch_fn = lambda: torch_op(a)
