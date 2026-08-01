@@ -541,6 +541,24 @@ async function fetchJSON(path, opts = {}) {
   delete fetchOpts.retries;
   delete fetchOpts.retryDelayMs;
 
+  if (path === "/api/training/apply-eval-mode" && fetchOpts.body && lastTrainingStatus?.active) {
+    try {
+      const payload = JSON.parse(fetchOpts.body);
+      const requestedAlgorithm = payload?.algorithm_mode || "rl";
+      const activeAlgorithm = lastTrainingStatus?.job?.algorithm_mode || "rl";
+      if (requestedAlgorithm !== activeAlgorithm) {
+        await stopTraining();
+        throw new Error("算法切换已转为先停止当前训练；不会通过评估模式接口跨算法应用。");
+      }
+    } catch (e) {
+      if (e instanceof SyntaxError) {
+        // Invalid request JSON should still be sent to the API so it can return the proper error.
+      } else {
+        throw e;
+      }
+    }
+  }
+
   let lastNetworkMsg = null;
   for (let attempt = 1; attempt <= Math.max(1, maxRetries); attempt++) {
     let res;
@@ -1720,60 +1738,7 @@ async function browseDataFile() {
 }
 
 async function applyEvalModeToCurrentTraining() {
-  const mode = getEvalMode();
-  const algorithm = getAlgorithmMode();
-  const replayPayload = scopedReplayConfigForAlgorithm();
-  const searchPayload = scopedSearchConfigForAlgorithm();
-  const replay = replayPolicyFromModules(replayPayload.modules);
-  const job = lastTrainingStatus?.job;
-  const current = job?.eval_mode;
-  const currentReplay = job?.replay_config
-    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
-    : (job?.replay_policy || "qd_incubation");
-  if (!lastTrainingStatus?.active) {
-    if (!job?.data_file) {
-      updateEvalModeApplyState(lastTrainingStatus);
-      return;
-    }
-    try {
-      const res = await fetchJSON("/api/training/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data_file: job.data_file, from_scratch: false, algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
-      });
-      selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
-      renderDataFileCard(res.data_file);
-      await refreshOverview();
-    } catch (e) {
-      $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }
-    return;
-  }
-  if ((job?.algorithm_mode || "rl") !== algorithm) {
-    await stopTraining();
-    return;
-  }
-  if (current === mode && currentReplay === replay && (job?.algorithm_mode || "rl") === algorithm) {
-    updateEvalModeApplyState(lastTrainingStatus);
-    return;
-  }
-  const ok = window.confirm(
-    `要把当前训练从 ${algorithmModeLabel(job?.algorithm_mode || "rl")} / ${evalModeLabel(current)} / ${replayPolicyLabel(currentReplay)} / ${searchPluginSummary(job?.search_config)} 切到 ${algorithmModeLabel(algorithm)} / ${evalModeLabel(mode)} / ${replayPolicyLabel(replayPolicyFromModules(replayPayload.modules))} / ${searchPluginSummary(searchPayload)} 吗？\n\n` +
-      "程序会先停止当前训练进程，再用同一个数据文件从检查点继续训练。"
-  );
-  if (!ok) return;
-  try {
-    const res = await fetchJSON("/api/training/apply-eval-mode", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
-    });
-    selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
-    renderDataFileCard(res.data_file);
-    await refreshOverview();
-  } catch (e) {
-    $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
+  await handleTrainingModeSelectionChange({ userInitiated: true });
 }
 
 async function handleAlgorithmModeSelectionChange() {
