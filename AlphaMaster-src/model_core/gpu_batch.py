@@ -39,13 +39,6 @@ class BatchPipelineResult:
 class BatchStackVM3D:
     """Shape-correct batch StackVM for both single-symbol and multi-symbol data."""
 
-    _VM_NATIVE_OP_ALLOWLIST = {
-        "NEG", "ABS", "SIGN", "POWER", "SIGNED_POWER_2", "SIGNED_LOG", "SQRT", "CLIP", "SIGMOID", "TANH_SQUASH",
-        "ADD", "SUB", "MUL", "DIV", "MAX", "MIN", "IF_GT", "GATE",
-        "DELAY1", "DELAY4", "DELTA", "DELTA_5",
-        "CS_SCALE", "CS_NEUTRALIZE",
-    }
-
     def __init__(self):
         self.feat_offset = FORMULA_VOCAB.operator_offset
         self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
@@ -57,25 +50,16 @@ class BatchStackVM3D:
         enabled = os.getenv("ALPHAMASTER_NATIVE_FORMULA_OPS", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not enabled or device.type != "cuda":
             return None
-        if self.native_ops is False:
-            return None
         if self.native_ops is None:
-            try:
-                from .native_backend import NativeElementwiseOps
+            from .native_backend import NativeElementwiseOps
 
-                self.native_ops = NativeElementwiseOps(verbose=False)
-            except Exception:
-                self.native_ops = False
-                return None
+            self.native_ops = NativeElementwiseOps(verbose=False)
         return self.native_ops
 
     def _apply_op(self, op_name: str, op_func, args: list[Tensor], device: torch.device) -> Tensor:
         native = self._native(device)
-        if native is not None and op_name in self._VM_NATIVE_OP_ALLOWLIST and native.supports(op_name, len(args)):
-            try:
-                return native.apply(op_name, *args)
-            except Exception:
-                pass
+        if native is not None and native.supports(op_name, len(args)):
+            return native.apply(op_name, *args)
         return op_func(*args)
 
     @staticmethod

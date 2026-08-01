@@ -94,6 +94,41 @@ NATIVE_CROSS_SECTIONAL_OPS = {
     "CS_NEUTRALIZE": 3030,
 }
 
+BITWISE_EXACT_NATIVE_OPS = {
+    "NEG",
+    "ABS",
+    "SIGN",
+    "POWER",
+    "SIGNED_POWER_2",
+    "SIGNED_LOG",
+    "SQRT",
+    "CLIP",
+    "SIGMOID",
+    "TANH_SQUASH",
+    "ADD",
+    "SUB",
+    "MUL",
+    "DIV",
+    "MAX",
+    "MIN",
+    "IF_GT",
+    "GATE",
+    "DELAY1",
+    "DELAY4",
+    "DELTA",
+    "DELTA_5",
+    "WMA",
+    "TS_MIN_10",
+    "TS_MIN_20",
+    "TS_MAX_10",
+    "TS_MAX_20",
+    "TS_ARG_MAX_5",
+    "TS_ARG_MIN_5",
+    "TS_RANK_5",
+    "MAX3",
+    "CS_SCALE",
+}
+
 
 @dataclass(frozen=True)
 class NativeBuildStatus:
@@ -155,7 +190,7 @@ def load_native_extension(verbose: bool = False):
         ],
         build_directory=str(build_dir),
         extra_cflags=["/O2"] if os.name == "nt" else ["-O3"],
-        extra_cuda_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--fmad=false"],
         verbose=verbose,
         with_cuda=True,
     )
@@ -169,6 +204,8 @@ class NativeElementwiseOps:
 
     @staticmethod
     def supports(op_name: str, arity: int) -> bool:
+        if op_name not in BITWISE_EXACT_NATIVE_OPS:
+            return False
         if arity == 1:
             return (
                 op_name in NATIVE_UNARY_OPS

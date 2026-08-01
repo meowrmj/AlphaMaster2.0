@@ -10,7 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model_core.native_backend import NativeElementwiseOps, probe_native_build
+from model_core.native_backend import BITWISE_EXACT_NATIVE_OPS, NativeElementwiseOps, probe_native_build
 from model_core.batch_ops import BATCH_OPS_CONFIG
 
 
@@ -48,6 +48,8 @@ def main() -> None:
         ("SUB", native.apply("SUB", a, b), a - b),
         ("MUL", native.apply("MUL", a, b), a * b),
         ("DIV", native.apply("DIV", a, b), a / (b + 1e-6)),
+        ("MAX", native.apply("MAX", a, b), torch.maximum(a, b)),
+        ("MIN", native.apply("MIN", a, b), torch.minimum(a, b)),
         ("IF_GT", native.apply("IF_GT", a, b, c), torch.where(a > 0, b, c)),
         ("GATE", native.apply("GATE", a, b, c), (a > 0).float() * b + (a <= 0).float() * c),
         ("DELAY1", native.apply("DELAY1", a), _batch_op("DELAY1")(a)),
@@ -92,9 +94,11 @@ def main() -> None:
         ("COVARIANCE_10", native.apply("COVARIANCE_10", a, b), _batch_op("COVARIANCE_10")(a, b)),
     ]
     for name, got, expected in checks:
-        diff = (got - torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)).abs().max().item()
+        expected = torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)
+        diff = (got - expected).abs().max().item()
         print(name, "max_diff", diff)
-        assert diff <= 1e-5, (name, diff)
+        if name in BITWISE_EXACT_NATIVE_OPS:
+            assert torch.equal(got, expected), (name, diff)
     for name in ("TS_ZSCORE_10", "TS_ZSCORE_20"):
         got = native.apply(name, flat)
         expected = _batch_op(name)(flat)

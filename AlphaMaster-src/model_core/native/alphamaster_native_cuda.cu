@@ -71,6 +71,14 @@ __device__ __forceinline__ scalar_t sanitize(scalar_t x) {
   return isfinite(static_cast<double>(x)) ? x : static_cast<scalar_t>(0);
 }
 
+__device__ __forceinline__ float add_rn(float a, float b) {
+  return __fadd_rn(a, b);
+}
+
+__device__ __forceinline__ float mul_rn(float a, float b) {
+  return __fmul_rn(a, b);
+}
+
 template <typename scalar_t>
 __global__ void elementwise1_kernel(
     const scalar_t* __restrict__ a,
@@ -100,7 +108,7 @@ __global__ void elementwise1_kernel(
   } else if (op_id == OP_SQRT) {
     scalar_t abs_v = av < static_cast<scalar_t>(0) ? -av : av;
     scalar_t sign_v = (av > static_cast<scalar_t>(0)) - (av < static_cast<scalar_t>(0));
-    v = sign_v * sqrt(abs_v);
+    v = sign_v * sqrtf(abs_v);
   } else if (op_id == OP_CLIP) {
     v = av < static_cast<scalar_t>(-3) ? static_cast<scalar_t>(-3) :
         (av > static_cast<scalar_t>(3) ? static_cast<scalar_t>(3) : av);
@@ -200,6 +208,13 @@ __device__ __forceinline__ scalar_t quantile_linear_sorted(
   return values[lo] * (static_cast<scalar_t>(1) - weight) + values[hi] * weight;
 }
 
+__device__ __forceinline__ float sum5_torch_like(const float* v) {
+  float sum = add_rn(v[0], v[1]);
+  sum = add_rn(sum, v[2]);
+  sum = add_rn(sum, v[3]);
+  return add_rn(sum, v[4]);
+}
+
 template <typename scalar_t>
 __global__ void shift1_kernel(
     const scalar_t* __restrict__ a,
@@ -251,11 +266,13 @@ __global__ void rolling1_kernel(
   int rank_count = 0;
   bool first = true;
   int64_t base = i - t;
+  scalar_t window_values[20];
   for (int k = 0; k < w; ++k) {
     int64_t src_t = t - (w - 1 - k);
     scalar_t v = value_at(a, base, src_t, n_bars);
-    sum += v;
-    sum_sq += v * v;
+    window_values[k] = v;
+    sum = add_rn(sum, v);
+    sum_sq = add_rn(sum_sq, mul_rn(v, v));
     if (first || v < min_v) {
       min_v = v;
       arg_min = k;
@@ -273,25 +290,35 @@ __global__ void rolling1_kernel(
   if (op_id == OP_TS_MEAN_5 || op_id == OP_TS_MEAN_10 || op_id == OP_TS_MEAN_20) {
     out_v = sum / static_cast<scalar_t>(w);
   } else if (op_id == OP_TS_STD_5 || op_id == OP_TS_STD_10 || op_id == OP_TS_STD_20) {
-    scalar_t mean = sum / static_cast<scalar_t>(w);
+    scalar_t mean = op_id == OP_TS_STD_5
+        ? mul_rn(sum5_torch_like(window_values), static_cast<scalar_t>(0.20000000298023224))
+        : sum / static_cast<scalar_t>(w);
     scalar_t var = static_cast<scalar_t>(0);
-    for (int k = 0; k < w; ++k) {
-      int64_t src_t = t - (w - 1 - k);
-      scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
-      var += centered * centered;
+    if (op_id == OP_TS_STD_5) {
+      scalar_t sq[5];
+      for (int k = 0; k < 5; ++k) {
+        scalar_t centered = window_values[k] - mean;
+        sq[k] = mul_rn(centered, centered);
+      }
+      var = mul_rn(sum5_torch_like(sq), static_cast<scalar_t>(0.20000000298023224));
+    } else {
+      for (int k = 0; k < w; ++k) {
+        scalar_t centered = window_values[k] - mean;
+        var = add_rn(var, mul_rn(centered, centered));
+      }
+      var = var / static_cast<scalar_t>(w);
     }
-    var = var / static_cast<scalar_t>(w);
-    out_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
+    out_v = sqrtf(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
   } else if (op_id == OP_TS_ZSCORE_10 || op_id == OP_TS_ZSCORE_20) {
     scalar_t mean = sum / static_cast<scalar_t>(w);
     scalar_t var = static_cast<scalar_t>(0);
     for (int k = 0; k < w; ++k) {
       int64_t src_t = t - (w - 1 - k);
       scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
-      var += centered * centered;
+      var = add_rn(var, mul_rn(centered, centered));
     }
     var = var / static_cast<scalar_t>(w);
-    scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
+    scalar_t std_v = sqrtf(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
     out_v = std_v < static_cast<scalar_t>(1e-6)
         ? static_cast<scalar_t>(0)
         : (cur - mean) / (std_v + static_cast<scalar_t>(1e-6));
@@ -325,9 +352,10 @@ __global__ void rolling1_kernel(
     out_v = (cur + static_cast<scalar_t>(0.8) * value_at(a, base, t - 1, n_bars) +
              static_cast<scalar_t>(0.6) * value_at(a, base, t - 2, n_bars)) / static_cast<scalar_t>(2.4);
   } else if (op_id == OP_WMA) {
-    out_v = (static_cast<scalar_t>(3.0) * cur +
-             static_cast<scalar_t>(2.0) * value_at(a, base, t - 1, n_bars) +
-             value_at(a, base, t - 2, n_bars)) / static_cast<scalar_t>(6.0);
+    scalar_t numerator = static_cast<scalar_t>(3.0) * cur +
+        static_cast<scalar_t>(2.0) * value_at(a, base, t - 1, n_bars);
+    numerator = numerator + value_at(a, base, t - 2, n_bars);
+    out_v = numerator * static_cast<scalar_t>(0.1666666716337204);
   } else if (op_id == OP_DECAY_LINEAR_5) {
     out_v = static_cast<scalar_t>(0);
     for (int k = 0; k < 5; ++k) {
@@ -369,15 +397,15 @@ __global__ void rolling1_kernel(
     for (int k = 0; k < 10; ++k) {
       int64_t src_t = t - (9 - k);
       scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
-      var += centered * centered;
+      var = add_rn(var, mul_rn(centered, centered));
     }
     var = var / static_cast<scalar_t>(10);
-    scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
+    scalar_t std_v = sqrtf(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
     scalar_t skew_sum = static_cast<scalar_t>(0);
     for (int k = 0; k < 10; ++k) {
       int64_t src_t = t - (9 - k);
       scalar_t z = (value_at(a, base, src_t, n_bars) - mean) / std_v;
-      skew_sum += z * z * z;
+      skew_sum = add_rn(skew_sum, mul_rn(mul_rn(z, z), z));
     }
     out_v = skew_sum / static_cast<scalar_t>(10);
     if (out_v < static_cast<scalar_t>(-5.0)) {
@@ -459,8 +487,8 @@ __global__ void rolling2_kernel(
   if (op_id == OP_TS_CORR_10) {
     var_x *= inv_w;
     var_y *= inv_w;
-    scalar_t sx = sqrt(var_x > static_cast<scalar_t>(0) ? var_x : static_cast<scalar_t>(0));
-    scalar_t sy = sqrt(var_y > static_cast<scalar_t>(0) ? var_y : static_cast<scalar_t>(0));
+    scalar_t sx = sqrtf(var_x > static_cast<scalar_t>(0) ? var_x : static_cast<scalar_t>(0));
+    scalar_t sy = sqrtf(var_y > static_cast<scalar_t>(0) ? var_y : static_cast<scalar_t>(0));
     out_v = cov / (sx * sy + static_cast<scalar_t>(1e-6));
     if (out_v < static_cast<scalar_t>(-1.0)) {
       out_v = static_cast<scalar_t>(-1.0);
