@@ -58,7 +58,8 @@ class BatchStackVM3D:
             if not self._native_status_logged:
                 disabled = ",".join(sorted(self.native_ops.disabled_ops)) or "-"
                 print(
-                    f"[NativeFormulaOps] enabled device={device} disabled_ops={disabled}",
+                    f"[NativeFormulaOps] enabled device={device} "
+                    f"policy={self.native_ops.policy} disabled_ops={disabled}",
                     flush=True,
                 )
                 self._native_status_logged = True

@@ -149,16 +149,19 @@ def _apply_eval_mode_env(env: dict[str, str], eval_mode: str) -> None:
         env["ALPHAMASTER_GPU_BATCH_EVAL"] = "1"
         env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "1"
         env["ALPHAMASTER_NATIVE_FORMULA_OPS"] = "1"
+        env["ALPHAMASTER_NATIVE_OP_POLICY"] = "aggressive"
     elif eval_mode == "legacy_cpu":
         env["ALPHAMASTER_DEVICE"] = "cpu"
         env["ALPHAMASTER_GPU_BATCH_EVAL"] = "0"
         env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "1"
         env["ALPHAMASTER_NATIVE_FORMULA_OPS"] = "0"
+        env.pop("ALPHAMASTER_NATIVE_OP_POLICY", None)
     else:
         env["ALPHAMASTER_DEVICE"] = "cpu"
         env["ALPHAMASTER_GPU_BATCH_EVAL"] = "1"
         env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "1"
         env["ALPHAMASTER_NATIVE_FORMULA_OPS"] = "0"
+        env.pop("ALPHAMASTER_NATIVE_OP_POLICY", None)
 
 
 def _apply_native_toolchain_env(env: dict[str, str]) -> None:

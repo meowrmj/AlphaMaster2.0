@@ -106,6 +106,50 @@ NUMERICALLY_STABLE_NATIVE_OPS = (
     | set(NATIVE_CROSS_SECTIONAL_OPS)
 )
 
+AGGRESSIVE_DISABLED_OPS = {
+    "DECAY",
+    "MOMENTUM_10",
+}
+
+STRICT_DISABLED_OPS = {
+    "COVARIANCE_10",
+    "CS_NEUTRALIZE",
+    "CS_SCALE",
+    "DECAY",
+    "DECAY_LINEAR_5",
+    "DIV",
+    "EMA_5",
+    "EMA_20",
+    "MOMENTUM_5",
+    "MOMENTUM_10",
+    "TS_ARG_MAX_5",
+    "TS_ARG_MIN_5",
+    "TS_CORR_10",
+    "TS_DECAY_EXP_5",
+    "TS_MAX_10",
+    "TS_MAX_20",
+    "TS_MEAN_5",
+    "TS_MEAN_10",
+    "TS_MEAN_20",
+    "TS_MIN_10",
+    "TS_MIN_20",
+    "TS_QUANTILE_10",
+    "TS_RANK_5",
+    "TS_RANK_10",
+    "TS_RANK_20",
+    "TS_SKEW_10",
+    "TS_STD_5",
+    "TS_STD_10",
+    "TS_STD_20",
+    "TS_SUM_5",
+    "TS_SUM_10",
+    "TS_SUM_20",
+    "TS_ZSCORE_10",
+    "TS_ZSCORE_20",
+    "WINSORIZE",
+    "WMA",
+}
+
 
 @dataclass(frozen=True)
 class NativeBuildStatus:
@@ -249,8 +293,17 @@ class NativeElementwiseOps:
 
     def __init__(self, ext=None, verbose: bool = False):
         self.ext = ext if ext is not None else load_native_extension(verbose=verbose)
-        disabled = os.getenv("ALPHAMASTER_NATIVE_DISABLED_OPS", "DECAY,MOMENTUM_10")
-        self.disabled_ops = {op.strip().upper() for op in disabled.split(",") if op.strip()}
+        self.policy = os.getenv("ALPHAMASTER_NATIVE_OP_POLICY", "aggressive").strip().lower()
+        if self.policy in {"strict", "verified"}:
+            disabled_ops = set(STRICT_DISABLED_OPS)
+        elif self.policy == "aggressive":
+            disabled_ops = set(AGGRESSIVE_DISABLED_OPS)
+        else:
+            raise ValueError(f"unknown native op policy: {self.policy}")
+
+        extra_disabled = os.getenv("ALPHAMASTER_NATIVE_DISABLED_OPS", "")
+        disabled_ops.update(op.strip().upper() for op in extra_disabled.split(",") if op.strip())
+        self.disabled_ops = disabled_ops
 
     def supports(self, op_name: str, arity: int) -> bool:
         if op_name in self.disabled_ops:
