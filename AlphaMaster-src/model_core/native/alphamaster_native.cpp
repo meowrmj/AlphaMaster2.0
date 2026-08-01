@@ -6,6 +6,7 @@ at::Tensor elementwise1_cuda(at::Tensor a, int64_t op_id);
 at::Tensor shift1_cuda(at::Tensor a, int64_t op_id);
 at::Tensor rolling1_cuda(at::Tensor a, int64_t op_id);
 at::Tensor rolling2_cuda(at::Tensor a, at::Tensor b, int64_t op_id);
+at::Tensor cross_sectional1_cuda(at::Tensor a, int64_t op_id);
 
 at::Tensor elementwise1(at::Tensor a, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
@@ -47,6 +48,12 @@ at::Tensor rolling2(at::Tensor a, at::Tensor b, int64_t op_id) {
   return rolling2_cuda(a.contiguous(), b.contiguous(), op_id);
 }
 
+at::Tensor cross_sectional1(at::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
+  TORCH_CHECK(a.dim() == 3, "a must be [B,N,T]");
+  return cross_sectional1_cuda(a.contiguous(), op_id);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("elementwise1", &elementwise1, "AlphaMaster elementwise unary CUDA ops");
   m.def("elementwise2", &elementwise2, "AlphaMaster elementwise binary CUDA ops");
@@ -54,4 +61,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("shift1", &shift1, "AlphaMaster shift CUDA ops");
   m.def("rolling1", &rolling1, "AlphaMaster rolling CUDA ops");
   m.def("rolling2", &rolling2, "AlphaMaster rolling binary CUDA ops");
+  m.def("cross_sectional1", &cross_sectional1, "AlphaMaster cross-sectional CUDA ops");
 }

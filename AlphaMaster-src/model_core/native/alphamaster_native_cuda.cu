@@ -63,6 +63,8 @@ constexpr int OP_MOMENTUM_10 = 1510;
 constexpr int OP_MAX3 = 1603;
 constexpr int OP_TS_CORR_10 = 2010;
 constexpr int OP_COVARIANCE_10 = 2020;
+constexpr int OP_CS_SCALE = 3020;
+constexpr int OP_CS_NEUTRALIZE = 3030;
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t sanitize(scalar_t x) {
@@ -445,6 +447,59 @@ __global__ void rolling2_kernel(
 }
 
 template <typename scalar_t>
+__global__ void cross_sectional1_kernel(
+    const scalar_t* __restrict__ a,
+    scalar_t* __restrict__ out,
+    int64_t bsz,
+    int64_t n_symbols,
+    int64_t n_bars,
+    int64_t op_id) {
+  int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t columns = bsz * n_bars;
+  if (col >= columns) {
+    return;
+  }
+  int64_t b = col / n_bars;
+  int64_t t = col % n_bars;
+  int64_t base = b * n_symbols * n_bars + t;
+
+  if (n_symbols == 1) {
+    scalar_t v = a[base];
+    scalar_t fallback = op_id == OP_CS_SCALE ? static_cast<scalar_t>(0.5) : static_cast<scalar_t>(0.0);
+    out[base] = isfinite(static_cast<double>(v)) ? v : fallback;
+    return;
+  }
+
+  if (op_id == OP_CS_NEUTRALIZE) {
+    scalar_t sum = static_cast<scalar_t>(0);
+    for (int64_t n = 0; n < n_symbols; ++n) {
+      sum += a[base + n * n_bars];
+    }
+    scalar_t mean = sum / static_cast<scalar_t>(n_symbols);
+    for (int64_t n = 0; n < n_symbols; ++n) {
+      out[base + n * n_bars] = sanitize(a[base + n * n_bars] - mean);
+    }
+  } else if (op_id == OP_CS_SCALE) {
+    scalar_t mn = a[base];
+    scalar_t mx = a[base];
+    for (int64_t n = 1; n < n_symbols; ++n) {
+      scalar_t v = a[base + n * n_bars];
+      mn = v < mn ? v : mn;
+      mx = v > mx ? v : mx;
+    }
+    scalar_t span = mx - mn;
+    bool zero_span = fabs(static_cast<double>(span)) < 1e-9;
+    for (int64_t n = 0; n < n_symbols; ++n) {
+      scalar_t v = zero_span ? static_cast<scalar_t>(0.5) : (a[base + n * n_bars] - mn) / span;
+      if (!isfinite(static_cast<double>(v))) {
+        v = static_cast<scalar_t>(0.5);
+      }
+      out[base + n * n_bars] = v;
+    }
+  }
+}
+
+template <typename scalar_t>
 __global__ void elementwise3_kernel(
     const scalar_t* __restrict__ a,
     const scalar_t* __restrict__ b,
@@ -585,6 +640,26 @@ at::Tensor rolling2_cuda(at::Tensor a, at::Tensor b, int64_t op_id) {
   rolling2_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       a.data_ptr<float>(),
       b.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor cross_sectional1_cuda(at::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t bsz = a.size(0);
+  int64_t n_symbols = a.size(1);
+  int64_t n_bars = a.size(2);
+  int64_t columns = bsz * n_bars;
+  constexpr int threads = 128;
+  int blocks = static_cast<int>((columns + threads - 1) / threads);
+  cross_sectional1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
       out.data_ptr<float>(),
       bsz,
       n_symbols,

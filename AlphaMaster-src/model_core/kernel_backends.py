@@ -98,7 +98,15 @@ class NativeElementwiseDryRunBackend(DryRunKernelBackend):
     name = "native_elementwise_dry_run"
 
     def __init__(self):
-        super().__init__(families={KernelFamily.ELEMENTWISE, KernelFamily.BRANCH, KernelFamily.SHIFT, KernelFamily.ROLLING})
+        super().__init__(
+            families={
+                KernelFamily.ELEMENTWISE,
+                KernelFamily.BRANCH,
+                KernelFamily.SHIFT,
+                KernelFamily.ROLLING,
+                KernelFamily.CROSS_SECTIONAL,
+            }
+        )
 
     def analyze(self, plan: KernelExecutionPlan) -> KernelBackendReport:
         executable = 0

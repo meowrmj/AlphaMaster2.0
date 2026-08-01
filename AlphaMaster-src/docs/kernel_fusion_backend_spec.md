@@ -67,6 +67,9 @@ TS_CORR_10 / COVARIANCE_10
 三元:
 IF_GT / GATE
 
+横截面:
+CS_SCALE / CS_NEUTRALIZE
+
 位移:
 DELAY1 / DELAY4 / DELTA / DELTA_5
 
@@ -119,6 +122,8 @@ TS_CORR_10:     native 约 49.76x
 COVARIANCE_10:  native 约 23.63x
 WINSORIZE:      native 约 11.67x
 TS_SKEW_10:     native 约 25.67x
+CS_SCALE:       native 约 10.73x（32 品种）
+CS_NEUTRALIZE:  native 约 1.79x（32 品种）
 ```
 
 注意：这是单算子速度，不等于完整训练 step 速度。完整 step 还包括采样、精英/孵化策略、打分聚合、梯度更新等环节。
@@ -129,6 +134,7 @@ TS_SKEW_10:     native 约 25.67x
 SCALE: 数值正确，但当前 native 串行扫描实现比 PyTorch 慢。
 JUMP: 数值正确，但当前 native 串行扫描实现比 PyTorch 慢。
 PRODUCT_5: 当前 native 实现与 PyTorch 路径最大误差超过 1e-5，继续 fallback。
+CS_RANK: 并列值时 PyTorch argsort 默认排序不是稳定排序，真实公式容易产生并列值，继续 fallback。
 ```
 
 ## 当前真实公式覆盖
@@ -145,8 +151,8 @@ PRODUCT_5: 当前 native 实现与 PyTorch 路径最大误差超过 1e-5，继�
 formulas = 192
 token_steps = 8
 bucketed launches = 185
-native executable launches = 171
-fallback launches = 14
+native executable launches = 176
+fallback launches = 9
 ```
 
 剩余 fallback 主要来自：
@@ -154,9 +160,7 @@ fallback launches = 14
 ```text
 CS_RANK
 JUMP
-CS_SCALE
 SCALE
-CS_NEUTRALIZE
 PRODUCT_5
 ```
 
@@ -164,7 +168,7 @@ PRODUCT_5
 
 要继续接近“整轮 500-800ms”，只靠单算子还不够。后续优先级应该是：
 
-1. 扩展剩余 fallback 算子，优先 `CS_RANK / CS_SCALE / CS_NEUTRALIZE`。
+1. 扩展剩余 fallback 算子，优先重新设计 `SCALE / JUMP` 的并行前缀扫描实现。
 2. 做更粗粒度的 kernel fusion，减少公式 step 内多次 launch。
 3. 优化 AB 阶段，也就是 Transformer 采样、旧方向/新方向候选生成、精英或孵化策略注入。
 4. 保留 ScoreGuard，任何 native 快路径与标准路径不一致都必须 fallback。

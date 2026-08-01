@@ -60,6 +60,7 @@ def main() -> None:
             "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
             "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
             "MAX3",
+            "CS_SCALE", "CS_NEUTRALIZE",
             "TS_CORR_10", "COVARIANCE_10",
         ],
     )
@@ -120,6 +121,7 @@ def main() -> None:
         "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
         "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
         "MAX3",
+        "CS_SCALE", "CS_NEUTRALIZE",
     }:
         torch_op = _batch_op(args.op)
         torch_fn = lambda: torch_op(a)

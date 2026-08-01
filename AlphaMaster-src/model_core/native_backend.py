@@ -89,6 +89,11 @@ NATIVE_ROLLING_OPS = {
     "MAX3": 1603,
 }
 
+NATIVE_CROSS_SECTIONAL_OPS = {
+    "CS_SCALE": 3020,
+    "CS_NEUTRALIZE": 3030,
+}
+
 
 @dataclass(frozen=True)
 class NativeBuildStatus:
@@ -169,6 +174,7 @@ class NativeElementwiseOps:
                 op_name in NATIVE_UNARY_OPS
                 or op_name in NATIVE_SHIFT_OPS
                 or op_name in NATIVE_ROLLING_OPS
+                or op_name in NATIVE_CROSS_SECTIONAL_OPS
             )
         if arity == 2:
             return op_name in NATIVE_BINARY_OPS or op_name in NATIVE_ROLLING_BINARY_OPS
@@ -184,6 +190,8 @@ class NativeElementwiseOps:
             return self.ext.shift1(args[0], NATIVE_SHIFT_OPS[op_name])
         if arity == 1 and op_name in NATIVE_ROLLING_OPS:
             return self.ext.rolling1(args[0], NATIVE_ROLLING_OPS[op_name])
+        if arity == 1 and op_name in NATIVE_CROSS_SECTIONAL_OPS:
+            return self.ext.cross_sectional1(args[0], NATIVE_CROSS_SECTIONAL_OPS[op_name])
         if arity == 2 and op_name in NATIVE_BINARY_OPS:
             return self.ext.elementwise2(args[0], args[1], NATIVE_BINARY_OPS[op_name])
         if arity == 2 and op_name in NATIVE_ROLLING_BINARY_OPS:
