@@ -1,5 +1,6 @@
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -214,95 +215,90 @@ __global__ void elementwise3_kernel(
 
 }  // namespace
 
-torch::Tensor elementwise1_cuda(torch::Tensor a, int64_t op_id) {
-  auto out = torch::empty_like(a);
+at::Tensor elementwise1_cuda(at::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
   int64_t n = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((n + threads - 1) / threads);
-  AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "elementwise1_cuda", [&] {
-    elementwise1_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        n,
-        op_id);
-  });
+  elementwise1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      out.data_ptr<float>(),
+      n,
+      op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-torch::Tensor elementwise2_cuda(torch::Tensor a, torch::Tensor b, int64_t op_id) {
-  auto out = torch::empty_like(a);
+at::Tensor elementwise2_cuda(at::Tensor a, at::Tensor b, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
   int64_t n = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((n + threads - 1) / threads);
-  AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "elementwise2_cuda", [&] {
-    elementwise2_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<scalar_t>(),
-        b.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        n,
-        op_id);
-  });
+  elementwise2_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      out.data_ptr<float>(),
+      n,
+      op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-torch::Tensor elementwise3_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c, int64_t op_id) {
-  auto out = torch::empty_like(a);
+at::Tensor elementwise3_cuda(at::Tensor a, at::Tensor b, at::Tensor c, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
   int64_t n = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((n + threads - 1) / threads);
-  AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "elementwise3_cuda", [&] {
-    elementwise3_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<scalar_t>(),
-        b.data_ptr<scalar_t>(),
-        c.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        n,
-        op_id);
-  });
+  elementwise3_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      c.data_ptr<float>(),
+      out.data_ptr<float>(),
+      n,
+      op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-torch::Tensor shift1_cuda(torch::Tensor a, int64_t op_id) {
-  auto out = torch::empty_like(a);
+at::Tensor shift1_cuda(at::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
   int64_t bsz = a.size(0);
   int64_t n_symbols = a.size(1);
   int64_t n_bars = a.size(2);
   int64_t total = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((total + threads - 1) / threads);
-  AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "shift1_cuda", [&] {
-    shift1_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        bsz,
-        n_symbols,
-        n_bars,
-        op_id);
-  });
+  shift1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-torch::Tensor rolling1_cuda(torch::Tensor a, int64_t op_id) {
-  auto out = torch::empty_like(a);
+at::Tensor rolling1_cuda(at::Tensor a, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
   int64_t bsz = a.size(0);
   int64_t n_symbols = a.size(1);
   int64_t n_bars = a.size(2);
   int64_t total = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((total + threads - 1) / threads);
-  AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "rolling1_cuda", [&] {
-    rolling1_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<scalar_t>(),
-        out.data_ptr<scalar_t>(),
-        bsz,
-        n_symbols,
-        n_bars,
-        op_id);
-  });
+  rolling1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

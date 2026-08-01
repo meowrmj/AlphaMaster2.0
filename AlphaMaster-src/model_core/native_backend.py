@@ -109,6 +109,8 @@ def load_native_extension(verbose: bool = False):
         os.environ.setdefault("CUDA_HOME", status.cuda_home)
         os.environ.setdefault("CUDA_PATH", status.cuda_home)
         cpp_extension.CUDA_HOME = status.cuda_home
+    if hasattr(cpp_extension, "SUBPROCESS_DECODE_ARGS"):
+        cpp_extension.SUBPROCESS_DECODE_ARGS = ("utf-8", "ignore")
     build_dir = ROOT.parent / "build" / "alphamaster_native"
     build_dir.mkdir(parents=True, exist_ok=True)
     return load(
@@ -119,7 +121,7 @@ def load_native_extension(verbose: bool = False):
         ],
         build_directory=str(build_dir),
         extra_cflags=["/O2"] if os.name == "nt" else ["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=["-O3"],
         verbose=verbose,
         with_cuda=True,
     )

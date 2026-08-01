@@ -1,24 +1,24 @@
 #include <torch/extension.h>
 
-torch::Tensor elementwise2_cuda(torch::Tensor a, torch::Tensor b, int64_t op_id);
-torch::Tensor elementwise3_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c, int64_t op_id);
-torch::Tensor elementwise1_cuda(torch::Tensor a, int64_t op_id);
-torch::Tensor shift1_cuda(torch::Tensor a, int64_t op_id);
-torch::Tensor rolling1_cuda(torch::Tensor a, int64_t op_id);
+at::Tensor elementwise2_cuda(at::Tensor a, at::Tensor b, int64_t op_id);
+at::Tensor elementwise3_cuda(at::Tensor a, at::Tensor b, at::Tensor c, int64_t op_id);
+at::Tensor elementwise1_cuda(at::Tensor a, int64_t op_id);
+at::Tensor shift1_cuda(at::Tensor a, int64_t op_id);
+at::Tensor rolling1_cuda(at::Tensor a, int64_t op_id);
 
-torch::Tensor elementwise1(torch::Tensor a, int64_t op_id) {
+at::Tensor elementwise1(at::Tensor a, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
   return elementwise1_cuda(a.contiguous(), op_id);
 }
 
-torch::Tensor elementwise2(torch::Tensor a, torch::Tensor b, int64_t op_id) {
+at::Tensor elementwise2(at::Tensor a, at::Tensor b, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
   TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
   TORCH_CHECK(a.sizes() == b.sizes(), "a and b must have the same shape");
   return elementwise2_cuda(a.contiguous(), b.contiguous(), op_id);
 }
 
-torch::Tensor elementwise3(torch::Tensor a, torch::Tensor b, torch::Tensor c, int64_t op_id) {
+at::Tensor elementwise3(at::Tensor a, at::Tensor b, at::Tensor c, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
   TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
   TORCH_CHECK(c.is_cuda(), "c must be a CUDA tensor");
@@ -26,13 +26,13 @@ torch::Tensor elementwise3(torch::Tensor a, torch::Tensor b, torch::Tensor c, in
   return elementwise3_cuda(a.contiguous(), b.contiguous(), c.contiguous(), op_id);
 }
 
-torch::Tensor shift1(torch::Tensor a, int64_t op_id) {
+at::Tensor shift1(at::Tensor a, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
   TORCH_CHECK(a.dim() == 3, "a must be [B,N,T]");
   return shift1_cuda(a.contiguous(), op_id);
 }
 
-torch::Tensor rolling1(torch::Tensor a, int64_t op_id) {
+at::Tensor rolling1(at::Tensor a, int64_t op_id) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
   TORCH_CHECK(a.dim() == 3, "a must be [B,N,T]");
   return rolling1_cuda(a.contiguous(), op_id);
