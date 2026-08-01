@@ -274,13 +274,27 @@ __global__ void rolling1_kernel(
     out_v = sum / static_cast<scalar_t>(w);
   } else if (op_id == OP_TS_STD_5 || op_id == OP_TS_STD_10 || op_id == OP_TS_STD_20) {
     scalar_t mean = sum / static_cast<scalar_t>(w);
-    scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
+    scalar_t var = static_cast<scalar_t>(0);
+    for (int k = 0; k < w; ++k) {
+      int64_t src_t = t - (w - 1 - k);
+      scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
+      var += centered * centered;
+    }
+    var = var / static_cast<scalar_t>(w);
     out_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
   } else if (op_id == OP_TS_ZSCORE_10 || op_id == OP_TS_ZSCORE_20) {
     scalar_t mean = sum / static_cast<scalar_t>(w);
-    scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
+    scalar_t var = static_cast<scalar_t>(0);
+    for (int k = 0; k < w; ++k) {
+      int64_t src_t = t - (w - 1 - k);
+      scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
+      var += centered * centered;
+    }
+    var = var / static_cast<scalar_t>(w);
     scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
-    out_v = (cur - mean) / (std_v + static_cast<scalar_t>(1e-6));
+    out_v = std_v < static_cast<scalar_t>(1e-6)
+        ? static_cast<scalar_t>(0)
+        : (cur - mean) / (std_v + static_cast<scalar_t>(1e-6));
   } else if (op_id == OP_WINSORIZE) {
     scalar_t values[20];
     for (int k = 0; k < 20; ++k) {
@@ -351,7 +365,13 @@ __global__ void rolling1_kernel(
     out_v = out_v > d2 ? out_v : d2;
   } else if (op_id == OP_TS_SKEW_10) {
     scalar_t mean = sum / static_cast<scalar_t>(w);
-    scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
+    scalar_t var = static_cast<scalar_t>(0);
+    for (int k = 0; k < 10; ++k) {
+      int64_t src_t = t - (9 - k);
+      scalar_t centered = value_at(a, base, src_t, n_bars) - mean;
+      var += centered * centered;
+    }
+    var = var / static_cast<scalar_t>(10);
     scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
     scalar_t skew_sum = static_cast<scalar_t>(0);
     for (int k = 0; k < 10; ++k) {
@@ -413,27 +433,32 @@ __global__ void rolling2_kernel(
   constexpr int w = 10;
   scalar_t sum_x = static_cast<scalar_t>(0);
   scalar_t sum_y = static_cast<scalar_t>(0);
-  scalar_t sum_x2 = static_cast<scalar_t>(0);
-  scalar_t sum_y2 = static_cast<scalar_t>(0);
-  scalar_t sum_xy = static_cast<scalar_t>(0);
   for (int k = 0; k < w; ++k) {
     int64_t src_t = t - (w - 1 - k);
     scalar_t x = value_at(a, base, src_t, n_bars);
     scalar_t y = value_at(b, base, src_t, n_bars);
     sum_x += x;
     sum_y += y;
-    sum_x2 += x * x;
-    sum_y2 += y * y;
-    sum_xy += x * y;
   }
   scalar_t inv_w = static_cast<scalar_t>(1.0 / w);
   scalar_t mean_x = sum_x * inv_w;
   scalar_t mean_y = sum_y * inv_w;
-  scalar_t cov = sum_xy * inv_w - mean_x * mean_y;
+  scalar_t cov = static_cast<scalar_t>(0);
+  scalar_t var_x = static_cast<scalar_t>(0);
+  scalar_t var_y = static_cast<scalar_t>(0);
+  for (int k = 0; k < w; ++k) {
+    int64_t src_t = t - (w - 1 - k);
+    scalar_t cx = value_at(a, base, src_t, n_bars) - mean_x;
+    scalar_t cy = value_at(b, base, src_t, n_bars) - mean_y;
+    cov += cx * cy;
+    var_x += cx * cx;
+    var_y += cy * cy;
+  }
+  cov *= inv_w;
   scalar_t out_v = cov;
   if (op_id == OP_TS_CORR_10) {
-    scalar_t var_x = sum_x2 * inv_w - mean_x * mean_x;
-    scalar_t var_y = sum_y2 * inv_w - mean_y * mean_y;
+    var_x *= inv_w;
+    var_y *= inv_w;
     scalar_t sx = sqrt(var_x > static_cast<scalar_t>(0) ? var_x : static_cast<scalar_t>(0));
     scalar_t sy = sqrt(var_y > static_cast<scalar_t>(0) ? var_y : static_cast<scalar_t>(0));
     out_v = cov / (sx * sy + static_cast<scalar_t>(1e-6));

@@ -31,6 +31,7 @@ def main() -> None:
     a = torch.randn(16, 3, 257, device="cuda")
     b = torch.randn_like(a)
     c = torch.randn_like(a)
+    flat = torch.ones_like(a) * 0.25
 
     checks = [
         ("NEG", native.apply("NEG", a), -a),
@@ -93,6 +94,12 @@ def main() -> None:
     for name, got, expected in checks:
         diff = (got - torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)).abs().max().item()
         print(name, "max_diff", diff)
+        assert diff <= 1e-5, (name, diff)
+    for name in ("TS_ZSCORE_10", "TS_ZSCORE_20"):
+        got = native.apply(name, flat)
+        expected = _batch_op(name)(flat)
+        diff = (got - torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)).abs().max().item()
+        print(name, "flat_max_diff", diff)
         assert diff <= 1e-5, (name, diff)
     print("native_elementwise_ok")
 

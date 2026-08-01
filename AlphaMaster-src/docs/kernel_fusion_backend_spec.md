@@ -185,3 +185,31 @@ native fast path
 ```
 
 这样可以继续榨 GPU 性能，但不牺牲评分正确性。
+
+## VM 接入验证
+
+当前已经提供 `ALPHAMASTER_NATIVE_FORMULA_OPS=1` 可选开关，让 `BatchStackVM3D` 在 CUDA 上对保守白名单算子调用 native kernel。
+
+真实 VM 白名单目前只启用：
+
+```text
+elementwise / branch / shift / CS_SCALE / CS_NEUTRALIZE
+```
+
+暂不在真实 VM 裸启用 rolling 统计类 kernel，原因是完整因子最终归一化会放大极小浮点差异。例如单个 rolling 算子误差只有 `1e-7` 量级，但经过后续公式组合和时间序列 zscore 归一化后，完整 factor 差异可能放大到 `1e-2` 甚至更高。
+
+VM 级验证命令：
+
+```powershell
+cmd /c scripts\with_native_toolchain.bat .venv\Scripts\python.exe scripts\benchmark_native_vm.py --repeat 5 --batch 192 --symbols 1 --bars 5555 --features 64 --length 8
+cmd /c scripts\with_native_toolchain.bat .venv\Scripts\python.exe scripts\benchmark_native_vm.py --repeat 5 --batch 192 --symbols 32 --bars 5555 --features 64 --length 8
+```
+
+当前结果：
+
+```text
+单品种: valid_equal=True, max_diff=0.0, native_vm_speedup=0.994x
+32 品种: valid_equal=True, max_diff=1.19e-6, native_vm_speedup=0.994x
+```
+
+结论：保守 VM 接入是安全的，但不是主要加速来源。真正的大收益仍来自 rolling 统计 kernel，不过它们需要在“完整公式结果”层面做 Guard 后才能进入训练快路径。
