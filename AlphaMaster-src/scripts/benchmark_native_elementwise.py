@@ -52,6 +52,12 @@ def main() -> None:
             "TS_MEAN_5", "TS_MEAN_10", "TS_MEAN_20",
             "TS_SUM_5", "TS_SUM_10", "TS_SUM_20",
             "TS_ZSCORE_10", "TS_ZSCORE_20",
+            "TS_STD_5", "TS_STD_10", "TS_STD_20",
+            "TS_RANK_5", "TS_RANK_10", "TS_RANK_20",
+            "TS_MIN_10", "TS_MIN_20", "TS_MAX_10", "TS_MAX_20",
+            "TS_QUANTILE_10", "TS_ARG_MAX_5", "TS_ARG_MIN_5",
+            "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
+            "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
         ],
     )
     args = parser.parse_args()
@@ -103,6 +109,12 @@ def main() -> None:
         "TS_MEAN_5", "TS_MEAN_10", "TS_MEAN_20",
         "TS_SUM_5", "TS_SUM_10", "TS_SUM_20",
         "TS_ZSCORE_10", "TS_ZSCORE_20",
+        "TS_STD_5", "TS_STD_10", "TS_STD_20",
+        "TS_RANK_5", "TS_RANK_10", "TS_RANK_20",
+        "TS_MIN_10", "TS_MIN_20", "TS_MAX_10", "TS_MAX_20",
+        "TS_QUANTILE_10", "TS_ARG_MAX_5", "TS_ARG_MIN_5",
+        "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
+        "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
     }:
         torch_op = _batch_op(args.op)
         torch_fn = lambda: torch_op(a)

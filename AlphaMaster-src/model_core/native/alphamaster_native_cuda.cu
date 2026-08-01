@@ -37,6 +37,27 @@ constexpr int OP_TS_SUM_10 = 410;
 constexpr int OP_TS_SUM_20 = 420;
 constexpr int OP_TS_ZSCORE_10 = 510;
 constexpr int OP_TS_ZSCORE_20 = 520;
+constexpr int OP_TS_STD_5 = 605;
+constexpr int OP_TS_STD_10 = 610;
+constexpr int OP_TS_STD_20 = 620;
+constexpr int OP_TS_RANK_5 = 705;
+constexpr int OP_TS_RANK_10 = 710;
+constexpr int OP_TS_RANK_20 = 720;
+constexpr int OP_TS_MIN_10 = 810;
+constexpr int OP_TS_MIN_20 = 820;
+constexpr int OP_TS_MAX_10 = 910;
+constexpr int OP_TS_MAX_20 = 920;
+constexpr int OP_TS_QUANTILE_10 = 1010;
+constexpr int OP_TS_ARG_MAX_5 = 1105;
+constexpr int OP_TS_ARG_MIN_5 = 1205;
+constexpr int OP_DECAY = 1303;
+constexpr int OP_WMA = 1304;
+constexpr int OP_DECAY_LINEAR_5 = 1305;
+constexpr int OP_TS_DECAY_EXP_5 = 1306;
+constexpr int OP_EMA_5 = 1405;
+constexpr int OP_EMA_20 = 1420;
+constexpr int OP_MOMENTUM_5 = 1505;
+constexpr int OP_MOMENTUM_10 = 1510;
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t sanitize(scalar_t x) {
@@ -118,13 +139,30 @@ __device__ __forceinline__ int window_for_op(int64_t op_id) {
   if (op_id == OP_TS_MEAN_5 || op_id == OP_TS_SUM_5) {
     return 5;
   }
-  if (op_id == OP_TS_MEAN_10 || op_id == OP_TS_SUM_10 || op_id == OP_TS_ZSCORE_10) {
+  if (op_id == OP_TS_MEAN_10 || op_id == OP_TS_SUM_10 || op_id == OP_TS_ZSCORE_10 ||
+      op_id == OP_TS_STD_10 || op_id == OP_TS_RANK_10 || op_id == OP_TS_MIN_10 ||
+      op_id == OP_TS_MAX_10 || op_id == OP_TS_QUANTILE_10) {
     return 10;
   }
-  if (op_id == OP_TS_MEAN_20 || op_id == OP_TS_SUM_20 || op_id == OP_TS_ZSCORE_20) {
+  if (op_id == OP_TS_MEAN_20 || op_id == OP_TS_SUM_20 || op_id == OP_TS_ZSCORE_20 ||
+      op_id == OP_TS_STD_20 || op_id == OP_TS_RANK_20 || op_id == OP_TS_MIN_20 ||
+      op_id == OP_TS_MAX_20) {
     return 20;
   }
+  if (op_id == OP_TS_STD_5 || op_id == OP_TS_RANK_5 || op_id == OP_TS_ARG_MAX_5 ||
+      op_id == OP_TS_ARG_MIN_5 || op_id == OP_DECAY_LINEAR_5 || op_id == OP_TS_DECAY_EXP_5) {
+    return 5;
+  }
   return 1;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t value_at(
+    const scalar_t* __restrict__ a,
+    int64_t base,
+    int64_t t,
+    int64_t n_bars) {
+  return (t >= 0 && t < n_bars) ? a[base + t] : static_cast<scalar_t>(0);
 }
 
 template <typename scalar_t>
@@ -170,22 +208,119 @@ __global__ void rolling1_kernel(
   int w = window_for_op(op_id);
   scalar_t sum = static_cast<scalar_t>(0);
   scalar_t sum_sq = static_cast<scalar_t>(0);
+  scalar_t cur = a[i];
+  scalar_t min_v = static_cast<scalar_t>(0);
+  scalar_t max_v = static_cast<scalar_t>(0);
+  int arg_min = 0;
+  int arg_max = 0;
+  int rank_count = 0;
+  bool first = true;
+  int64_t base = i - t;
   for (int k = 0; k < w; ++k) {
     int64_t src_t = t - (w - 1 - k);
-    scalar_t v = src_t >= 0 ? a[i + (src_t - t)] : static_cast<scalar_t>(0);
+    scalar_t v = value_at(a, base, src_t, n_bars);
     sum += v;
     sum_sq += v * v;
+    if (first || v < min_v) {
+      min_v = v;
+      arg_min = k;
+    }
+    if (first || v > max_v) {
+      max_v = v;
+      arg_max = k;
+    }
+    if (v < cur) {
+      rank_count += 1;
+    }
+    first = false;
   }
   scalar_t out_v = sum;
   if (op_id == OP_TS_MEAN_5 || op_id == OP_TS_MEAN_10 || op_id == OP_TS_MEAN_20) {
     out_v = sum / static_cast<scalar_t>(w);
+  } else if (op_id == OP_TS_STD_5 || op_id == OP_TS_STD_10 || op_id == OP_TS_STD_20) {
+    scalar_t mean = sum / static_cast<scalar_t>(w);
+    scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
+    out_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
   } else if (op_id == OP_TS_ZSCORE_10 || op_id == OP_TS_ZSCORE_20) {
     scalar_t mean = sum / static_cast<scalar_t>(w);
     scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
     scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
-    out_v = (a[i] - mean) / (std_v + static_cast<scalar_t>(1e-6));
+    out_v = (cur - mean) / (std_v + static_cast<scalar_t>(1e-6));
+  } else if (op_id == OP_TS_RANK_5 || op_id == OP_TS_RANK_10 || op_id == OP_TS_RANK_20 ||
+             op_id == OP_TS_QUANTILE_10) {
+    out_v = static_cast<scalar_t>(rank_count) / static_cast<scalar_t>(w);
+  } else if (op_id == OP_TS_MIN_10 || op_id == OP_TS_MIN_20) {
+    out_v = min_v;
+  } else if (op_id == OP_TS_MAX_10 || op_id == OP_TS_MAX_20) {
+    out_v = max_v;
+  } else if (op_id == OP_TS_ARG_MAX_5) {
+    out_v = static_cast<scalar_t>(arg_max) / static_cast<scalar_t>(w - 1);
+  } else if (op_id == OP_TS_ARG_MIN_5) {
+    out_v = static_cast<scalar_t>(arg_min) / static_cast<scalar_t>(w - 1);
+  } else if (op_id == OP_DECAY) {
+    out_v = (cur + static_cast<scalar_t>(0.8) * value_at(a, base, t - 1, n_bars) +
+             static_cast<scalar_t>(0.6) * value_at(a, base, t - 2, n_bars)) / static_cast<scalar_t>(2.4);
+  } else if (op_id == OP_WMA) {
+    out_v = (static_cast<scalar_t>(3.0) * cur +
+             static_cast<scalar_t>(2.0) * value_at(a, base, t - 1, n_bars) +
+             value_at(a, base, t - 2, n_bars)) / static_cast<scalar_t>(6.0);
+  } else if (op_id == OP_DECAY_LINEAR_5) {
+    out_v = static_cast<scalar_t>(0);
+    for (int k = 0; k < 5; ++k) {
+      int64_t src_t = t - (4 - k);
+      out_v += value_at(a, base, src_t, n_bars) * static_cast<scalar_t>(k + 1);
+    }
+    out_v = out_v / static_cast<scalar_t>(15.0);
+  } else if (op_id == OP_TS_DECAY_EXP_5) {
+    const scalar_t weights[5] = {
+        static_cast<scalar_t>(0.0322580645),
+        static_cast<scalar_t>(0.0645161290),
+        static_cast<scalar_t>(0.1290322581),
+        static_cast<scalar_t>(0.2580645161),
+        static_cast<scalar_t>(0.5161290323)};
+    out_v = static_cast<scalar_t>(0);
+    for (int k = 0; k < 5; ++k) {
+      int64_t src_t = t - (4 - k);
+      out_v += value_at(a, base, src_t, n_bars) * weights[k];
+    }
+  } else if (op_id == OP_MOMENTUM_5 || op_id == OP_MOMENTUM_10) {
+    int short_w = (op_id == OP_MOMENTUM_5) ? 5 : 10;
+    scalar_t short_sum = static_cast<scalar_t>(0);
+    scalar_t long_sum = static_cast<scalar_t>(0);
+    for (int k = 0; k < short_w; ++k) {
+      short_sum += value_at(a, base, t - (short_w - 1 - k), n_bars);
+    }
+    for (int k = 0; k < 20; ++k) {
+      long_sum += value_at(a, base, t - (19 - k), n_bars);
+    }
+    out_v = short_sum / static_cast<scalar_t>(short_w) - long_sum / static_cast<scalar_t>(20);
   }
   out[i] = sanitize(out_v);
+}
+
+template <typename scalar_t>
+__global__ void ema1_kernel(
+    const scalar_t* __restrict__ a,
+    scalar_t* __restrict__ out,
+    int64_t series_count,
+    int64_t n_bars,
+    int64_t op_id) {
+  int64_t series = blockIdx.x * blockDim.x + threadIdx.x;
+  if (series >= series_count) {
+    return;
+  }
+  scalar_t alpha = op_id == OP_EMA_5 ? static_cast<scalar_t>(2.0 / 6.0) : static_cast<scalar_t>(2.0 / 21.0);
+  int64_t base = series * n_bars;
+  if (n_bars <= 0) {
+    return;
+  }
+  scalar_t prev = a[base];
+  out[base] = sanitize(prev);
+  for (int64_t t = 1; t < n_bars; ++t) {
+    scalar_t cur = a[base + t];
+    prev = alpha * cur + (static_cast<scalar_t>(1) - alpha) * prev;
+    out[base + t] = sanitize(prev);
+  }
 }
 
 template <typename scalar_t>
@@ -289,6 +424,19 @@ at::Tensor rolling1_cuda(at::Tensor a, int64_t op_id) {
   int64_t bsz = a.size(0);
   int64_t n_symbols = a.size(1);
   int64_t n_bars = a.size(2);
+  if (op_id == OP_EMA_5 || op_id == OP_EMA_20) {
+    int64_t series_count = bsz * n_symbols;
+    constexpr int threads = 128;
+    int blocks = static_cast<int>((series_count + threads - 1) / threads);
+    ema1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        a.data_ptr<float>(),
+        out.data_ptr<float>(),
+        series_count,
+        n_bars,
+        op_id);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+  }
   int64_t total = a.numel();
   constexpr int threads = 256;
   int blocks = static_cast<int>((total + threads - 1) / threads);
