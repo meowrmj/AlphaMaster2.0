@@ -45,6 +45,7 @@ class BatchStackVM3D:
         self.op_name_map = {i + self.feat_offset: cfg[0] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
         self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
         self.native_ops = None
+        self._native_status_logged = False
 
     def _native(self, device: torch.device):
         enabled = os.getenv("ALPHAMASTER_NATIVE_FORMULA_OPS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -54,6 +55,13 @@ class BatchStackVM3D:
             from .native_backend import NativeElementwiseOps
 
             self.native_ops = NativeElementwiseOps(verbose=False)
+            if not self._native_status_logged:
+                disabled = ",".join(sorted(self.native_ops.disabled_ops)) or "-"
+                print(
+                    f"[NativeFormulaOps] enabled device={device} disabled_ops={disabled}",
+                    flush=True,
+                )
+                self._native_status_logged = True
         return self.native_ops
 
     def _apply_op(self, op_name: str, op_func, args: list[Tensor], device: torch.device) -> Tensor:

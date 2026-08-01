@@ -6,6 +6,7 @@
 
 # ===== Deep Learning & Numerical =====
 torch>=2.0.0
+ninja>=1.13.0
 numpy>=1.24.0
 scipy>=1.10.0
 

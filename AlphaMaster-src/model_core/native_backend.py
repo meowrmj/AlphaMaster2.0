@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -114,6 +116,19 @@ class NativeBuildStatus:
     has_cl: bool = False
 
 
+def _prepend_path(path: pathlib.Path | str | None) -> None:
+    if not path:
+        return
+    path = pathlib.Path(path)
+    if not path.exists():
+        return
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    path_s = str(path)
+    if not any(pathlib.Path(p) == path for p in parts if p):
+        os.environ["PATH"] = path_s + (os.pathsep + current if current else "")
+
+
 def _discover_cuda_home() -> str | None:
     if cpp_extension.CUDA_HOME:
         return str(cpp_extension.CUDA_HOME)
@@ -132,10 +147,68 @@ def _discover_cuda_home() -> str | None:
     return None
 
 
-def probe_native_build() -> NativeBuildStatus:
-    cuda_home = _discover_cuda_home()
-    nvcc = shutil.which("nvcc.exe") or shutil.which("nvcc")
+def _discover_msvc_cl() -> pathlib.Path | None:
     cl = shutil.which("cl.exe") or shutil.which("cl")
+    if cl:
+        return pathlib.Path(cl).resolve()
+
+    vswhere = pathlib.Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
+    if vswhere.exists():
+        try:
+            out = subprocess.check_output(
+                [
+                    str(vswhere),
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-find",
+                    r"VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                candidate = pathlib.Path(line.strip())
+                if candidate.exists():
+                    return candidate
+        except Exception:
+            pass
+
+    for root in (
+        pathlib.Path(r"C:\Program Files (x86)\Microsoft Visual Studio"),
+        pathlib.Path(r"C:\Program Files\Microsoft Visual Studio"),
+    ):
+        if not root.exists():
+            continue
+        matches = sorted(root.glob(r"**\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"), reverse=True)
+        for candidate in matches:
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _configure_native_build_environment() -> tuple[str | None, pathlib.Path | None]:
+    _prepend_path(pathlib.Path(sys.executable).resolve().parent)
+
+    cuda_home = _discover_cuda_home()
+    if cuda_home:
+        cuda_home_path = pathlib.Path(cuda_home)
+        os.environ.setdefault("CUDA_HOME", str(cuda_home_path))
+        os.environ.setdefault("CUDA_PATH", str(cuda_home_path))
+        cpp_extension.CUDA_HOME = str(cuda_home_path)
+        _prepend_path(cuda_home_path / "bin")
+
+    cl_path = _discover_msvc_cl()
+    if cl_path:
+        _prepend_path(cl_path.parent)
+    return cuda_home, cl_path
+
+
+def probe_native_build() -> NativeBuildStatus:
+    cuda_home, cl_path = _configure_native_build_environment()
+    nvcc = shutil.which("nvcc.exe") or shutil.which("nvcc")
+    cl = shutil.which("cl.exe") or shutil.which("cl") or (str(cl_path) if cl_path else None)
     if not torch.cuda.is_available():
         return NativeBuildStatus(False, "torch CUDA is not available", cuda_home, bool(nvcc), bool(cl))
     if not cuda_home and not nvcc:
