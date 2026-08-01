@@ -21,6 +21,8 @@ let trainingStartPending = false;
 let trainingPendingAction = null;
 let trainingRequestInFlight = false;
 let trainingModeApplyInFlight = false;
+let trainingAlgorithmSwitchInFlight = false;
+let trainingAlgorithmSwitchTarget = null;
 let pollTimer = null;
 let clientErrors = [];
 let debugMode = false;
@@ -166,6 +168,9 @@ function syncAlgorithmScopedControls() {
   }
   if (label) label.textContent = isGa ? "GA 评估模式" : "评估加速模式";
   updateReplayPolicySummary();
+  if (trainingStartPending || trainingModeApplyInFlight || trainingAlgorithmSwitchInFlight) {
+    setTrainingModeControlsDisabled(true);
+  }
 }
 
 function evalModeLabel(mode) {
@@ -302,8 +307,9 @@ function renderReplayPolicyPage() {
   if (label) label.textContent = `${REPLAY_PAGE_LABELS[replayPolicyPage] || "搜索增强"} ${replayPolicyPage + 1}/${pages.length}`;
   const prev = $("replayPolicyPrevBtn");
   const next = $("replayPolicyNextBtn");
-  if (prev) prev.disabled = replayPolicyPage <= 0;
-  if (next) next.disabled = replayPolicyPage >= pages.length - 1;
+  const locked = trainingStartPending || trainingModeApplyInFlight || trainingAlgorithmSwitchInFlight;
+  if (prev) prev.disabled = locked || replayPolicyPage <= 0;
+  if (next) next.disabled = locked || replayPolicyPage >= pages.length - 1;
 }
 
 function initEvalModeSelect() {
@@ -318,7 +324,6 @@ function initEvalModeSelect() {
     algorithmSelect.addEventListener("change", () => {
       algorithmMode = getAlgorithmMode();
       localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
-      syncAlgorithmScopedControls();
       handleAlgorithmModeSelectionChange();
     });
   }
@@ -541,24 +546,6 @@ async function fetchJSON(path, opts = {}) {
   delete fetchOpts.retries;
   delete fetchOpts.retryDelayMs;
 
-  if (path === "/api/training/apply-eval-mode" && fetchOpts.body && lastTrainingStatus?.active) {
-    try {
-      const payload = JSON.parse(fetchOpts.body);
-      const requestedAlgorithm = payload?.algorithm_mode || "rl";
-      const activeAlgorithm = lastTrainingStatus?.job?.algorithm_mode || "rl";
-      if (requestedAlgorithm !== activeAlgorithm) {
-        await stopTraining();
-        throw new Error("算法切换已转为先停止当前训练；不会通过评估模式接口跨算法应用。");
-      }
-    } catch (e) {
-      if (e instanceof SyntaxError) {
-        // Invalid request JSON should still be sent to the API so it can return the proper error.
-      } else {
-        throw e;
-      }
-    }
-  }
-
   let lastNetworkMsg = null;
   for (let attempt = 1; attempt <= Math.max(1, maxRetries); attempt++) {
     let res;
@@ -609,38 +596,66 @@ function setTrainingActionPending(action) {
   const startedAt = Date.now();
   trainingStartPending = Boolean(pending);
   trainingPendingAction = action || null;
-  const launchPending = action === "start" || action === "retrain";
+  const actionText = {
+    start: "等待中",
+    retrain: "等待中",
+    stop: "停止中",
+    "mode-switch": "切换中",
+    "algorithm-switch": "切换中",
+  }[action] || START_BTN_IDLE_TEXT;
+  const logText = {
+    start: "正在提交训练启动请求...",
+    retrain: "正在停止当前训练并准备重新训练...",
+    stop: "正在停止训练进程...",
+    "mode-switch": "正在保存当前节点，并按新训练设置续跑...",
+    "algorithm-switch": "正在停止当前训练，停稳后再切换算法...",
+  }[action] || "";
+  const startPendingText = action === "start" || action === "retrain" ? "等待中" : actionText;
   const startBtn = $("startBtn");
   const retrainBtn = $("retrainBtn");
   const stopBtn = $("stopBtn");
   const pill = $("jobPill");
   if (startBtn) {
     startBtn.disabled = pending || !selectedDataFile;
-    startBtn.textContent = launchPending ? "等待中" : START_BTN_IDLE_TEXT;
-    startBtn.classList.toggle("is-pending", launchPending);
+    startBtn.textContent = pending ? startPendingText : START_BTN_IDLE_TEXT;
+    startBtn.classList.toggle("is-pending", pending && action !== "stop");
   }
   if (retrainBtn) {
-    retrainBtn.disabled = !selectedDataFile;
+    retrainBtn.disabled = pending || !selectedDataFile;
     retrainBtn.textContent = RETRAIN_BTN_TEXT;
     retrainBtn.classList.remove("is-pending");
   }
   if (stopBtn) {
-    stopBtn.disabled = action === "stop" || !(lastTrainingStatus?.active);
-    stopBtn.textContent = action === "stop" ? "停止中" : STOP_BTN_TEXT;
-    stopBtn.classList.toggle("is-pending", action === "stop");
+    stopBtn.disabled = pending || !(lastTrainingStatus?.active);
+    stopBtn.textContent = action === "stop" || action === "algorithm-switch" ? "停止中" : STOP_BTN_TEXT;
+    stopBtn.classList.toggle("is-pending", action === "stop" || action === "algorithm-switch");
   }
   if (pill && pending) {
-    const pendingText = action === "stop" ? "停止中" : "等待中";
-    pill.innerHTML = `<i class="pill-dot"></i>${pendingText}`;
+    pill.innerHTML = `<i class="pill-dot"></i>${actionText}`;
     pill.className = "pill running";
   }
   const hint = $("logHint");
   if (hint && pending) {
-    hint.textContent = action === "stop"
-        ? "正在停止训练进程..."
-        : "正在提交训练启动请求...";
+    hint.textContent = logText;
   }
+  setTrainingModeControlsDisabled(pending);
   return startedAt;
+}
+
+function setTrainingModeControlsDisabled(disabled) {
+  const ids = [
+    "algorithmModeSelect",
+    "evalModeSelect",
+    "replayPolicyPrevBtn",
+    "replayPolicyNextBtn",
+  ];
+  for (const id of ids) {
+    const el = $(id);
+    if (el) el.disabled = Boolean(disabled);
+  }
+  for (const input of Array.from(document.querySelectorAll("[data-replay-module], [data-search-module]"))) {
+    input.disabled = Boolean(disabled);
+  }
 }
 
 function renderDataFileCard(info) {
@@ -1278,7 +1293,7 @@ function updateTrainingUI(training, progress) {
   const retrainBtn = $("retrainBtn");
   const stopBtn = $("stopBtn");
 
-  if (trainingStartPending && !trainingRequestInFlight) {
+  if (trainingStartPending && !trainingRequestInFlight && !trainingModeApplyInFlight && !trainingAlgorithmSwitchInFlight) {
     setTrainingActionPending(null);
   }
 
@@ -1742,13 +1757,47 @@ async function applyEvalModeToCurrentTraining() {
 }
 
 async function handleAlgorithmModeSelectionChange() {
+  const desiredAlgorithm = getAlgorithmMode();
   updateEvalModeApplyState(lastTrainingStatus);
   const job = lastTrainingStatus?.job;
   const activeAlgorithm = job?.algorithm_mode || "rl";
-  if (lastTrainingStatus?.active && job && activeAlgorithm !== getAlgorithmMode()) {
-    await stopTraining();
+  if (lastTrainingStatus?.active && job && activeAlgorithm !== desiredAlgorithm) {
+    const select = $("algorithmModeSelect");
+    if (select) select.value = activeAlgorithm;
+    algorithmMode = activeAlgorithm;
+    localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+    syncAlgorithmScopedControls();
+    trainingAlgorithmSwitchInFlight = true;
+    trainingAlgorithmSwitchTarget = desiredAlgorithm;
+    const pendingAt = setTrainingActionPending("algorithm-switch");
+    try {
+      await waitForNextPaint();
+      await fetchJSON("/api/training/stop", { method: "POST" });
+      await waitForTrainingInactive();
+      await waitForLaunchPendingMinimum(pendingAt);
+      if (select) select.value = desiredAlgorithm;
+      algorithmMode = desiredAlgorithm;
+      localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+      syncAlgorithmScopedControls();
+      setTrainingActionPending(null);
+      await refreshOverview();
+    } catch (e) {
+      await waitForLaunchPendingMinimum(pendingAt);
+      if (select) select.value = activeAlgorithm;
+      algorithmMode = activeAlgorithm;
+      localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+      syncAlgorithmScopedControls();
+      setTrainingActionPending(null);
+      $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } finally {
+      trainingAlgorithmSwitchInFlight = false;
+      trainingAlgorithmSwitchTarget = null;
+      if (trainingStartPending) setTrainingActionPending(null);
+      updateEvalModeApplyState(lastTrainingStatus);
+    }
     return;
   }
+  syncAlgorithmScopedControls();
   await refreshOverview();
 }
 
@@ -1776,6 +1825,12 @@ function updateEvalModeApplyState(training) {
     JSON.stringify(selectedSearchConfig.modules) !== JSON.stringify(normalizeSearchConfig(job?.search_config).modules)
   );
   const resumable = Boolean(!active && job?.data_file);
+
+  if (trainingAlgorithmSwitchInFlight) {
+    const targetAlgorithm = trainingAlgorithmSwitchTarget || selectedAlgorithm;
+    hint.textContent = `正在切换算法：先停止当前 ${algorithmModeLabel(activeAlgorithm)} 训练，停稳后再切到 ${algorithmModeLabel(targetAlgorithm)}。不会自动启动新算法。`;
+    return;
+  }
 
   if (trainingModeApplyInFlight) {
     hint.textContent = `正在应用：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。会先保存当前节点，再按新设置续跑。`;
@@ -1888,8 +1943,10 @@ async function applySelectedModeToActiveTraining(desired = selectedTrainingModeC
   }
 
   trainingModeApplyInFlight = true;
+  const pendingAt = setTrainingActionPending("mode-switch");
   updateEvalModeApplyState(lastTrainingStatus);
   try {
+    await waitForNextPaint();
     const res = await fetchJSON("/api/training/apply-eval-mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1903,16 +1960,21 @@ async function applySelectedModeToActiveTraining(desired = selectedTrainingModeC
     assertAppliedTrainingMode(res.job, desired);
     selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
     renderDataFileCard(res.data_file);
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
     await refreshOverview();
     if (res.job) {
       updateTrainingUI({ active: true, job: res.job, log_tail: [] }, null);
     }
   } catch (e) {
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
     await logClientError(e?.message || String(e), { path: "/api/training/apply-eval-mode", desired });
     restoreControlsFromTrainingJob(lastTrainingStatus?.job);
     $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } finally {
     trainingModeApplyInFlight = false;
+    if (trainingStartPending) setTrainingActionPending(null);
     updateEvalModeApplyState(lastTrainingStatus);
   }
 }
