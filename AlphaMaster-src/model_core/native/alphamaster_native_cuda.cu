@@ -59,6 +59,8 @@ constexpr int OP_EMA_20 = 1420;
 constexpr int OP_MOMENTUM_5 = 1505;
 constexpr int OP_MOMENTUM_10 = 1510;
 constexpr int OP_MAX3 = 1603;
+constexpr int OP_TS_CORR_10 = 2010;
+constexpr int OP_COVARIANCE_10 = 2020;
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t sanitize(scalar_t x) {
@@ -330,6 +332,58 @@ __global__ void ema1_kernel(
 }
 
 template <typename scalar_t>
+__global__ void rolling2_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    scalar_t* __restrict__ out,
+    int64_t bsz,
+    int64_t n_symbols,
+    int64_t n_bars,
+    int64_t op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = bsz * n_symbols * n_bars;
+  if (i >= total) {
+    return;
+  }
+  int64_t t = i % n_bars;
+  int64_t base = i - t;
+  constexpr int w = 10;
+  scalar_t sum_x = static_cast<scalar_t>(0);
+  scalar_t sum_y = static_cast<scalar_t>(0);
+  scalar_t sum_x2 = static_cast<scalar_t>(0);
+  scalar_t sum_y2 = static_cast<scalar_t>(0);
+  scalar_t sum_xy = static_cast<scalar_t>(0);
+  for (int k = 0; k < w; ++k) {
+    int64_t src_t = t - (w - 1 - k);
+    scalar_t x = value_at(a, base, src_t, n_bars);
+    scalar_t y = value_at(b, base, src_t, n_bars);
+    sum_x += x;
+    sum_y += y;
+    sum_x2 += x * x;
+    sum_y2 += y * y;
+    sum_xy += x * y;
+  }
+  scalar_t inv_w = static_cast<scalar_t>(1.0 / w);
+  scalar_t mean_x = sum_x * inv_w;
+  scalar_t mean_y = sum_y * inv_w;
+  scalar_t cov = sum_xy * inv_w - mean_x * mean_y;
+  scalar_t out_v = cov;
+  if (op_id == OP_TS_CORR_10) {
+    scalar_t var_x = sum_x2 * inv_w - mean_x * mean_x;
+    scalar_t var_y = sum_y2 * inv_w - mean_y * mean_y;
+    scalar_t sx = sqrt(var_x > static_cast<scalar_t>(0) ? var_x : static_cast<scalar_t>(0));
+    scalar_t sy = sqrt(var_y > static_cast<scalar_t>(0) ? var_y : static_cast<scalar_t>(0));
+    out_v = cov / (sx * sy + static_cast<scalar_t>(1e-6));
+    if (out_v < static_cast<scalar_t>(-1.0)) {
+      out_v = static_cast<scalar_t>(-1.0);
+    } else if (out_v > static_cast<scalar_t>(1.0)) {
+      out_v = static_cast<scalar_t>(1.0);
+    }
+  }
+  out[i] = sanitize(out_v);
+}
+
+template <typename scalar_t>
 __global__ void elementwise3_kernel(
     const scalar_t* __restrict__ a,
     const scalar_t* __restrict__ b,
@@ -448,6 +502,28 @@ at::Tensor rolling1_cuda(at::Tensor a, int64_t op_id) {
   int blocks = static_cast<int>((total + threads - 1) / threads);
   rolling1_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       a.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor rolling2_cuda(at::Tensor a, at::Tensor b, int64_t op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  TORCH_CHECK(b.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t bsz = a.size(0);
+  int64_t n_symbols = a.size(1);
+  int64_t n_bars = a.size(2);
+  int64_t total = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+  rolling2_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
       out.data_ptr<float>(),
       bsz,
       n_symbols,

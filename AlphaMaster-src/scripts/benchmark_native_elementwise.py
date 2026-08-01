@@ -59,6 +59,7 @@ def main() -> None:
             "DECAY", "WMA", "DECAY_LINEAR_5", "TS_DECAY_EXP_5",
             "EMA_5", "EMA_20", "MOMENTUM_5", "MOMENTUM_10",
             "MAX3",
+            "TS_CORR_10", "COVARIANCE_10",
         ],
     )
     args = parser.parse_args()
@@ -121,6 +122,10 @@ def main() -> None:
         torch_op = _batch_op(args.op)
         torch_fn = lambda: torch_op(a)
         native_fn = lambda: native.apply(args.op, a)
+    elif args.op in {"TS_CORR_10", "COVARIANCE_10"}:
+        torch_op = _batch_op(args.op)
+        torch_fn = lambda: torch_op(a, b)
+        native_fn = lambda: native.apply(args.op, a, b)
     elif args.op == "ADD":
         torch_fn = lambda: a + b
         native_fn = lambda: native.apply("ADD", a, b)

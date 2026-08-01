@@ -24,6 +24,11 @@ NATIVE_BINARY_OPS = {
     "MIN": 6,
 }
 
+NATIVE_ROLLING_BINARY_OPS = {
+    "TS_CORR_10": 2010,
+    "COVARIANCE_10": 2020,
+}
+
 NATIVE_UNARY_OPS = {
     "NEG": 51,
     "ABS": 52,
@@ -164,7 +169,7 @@ class NativeElementwiseOps:
                 or op_name in NATIVE_ROLLING_OPS
             )
         if arity == 2:
-            return op_name in NATIVE_BINARY_OPS
+            return op_name in NATIVE_BINARY_OPS or op_name in NATIVE_ROLLING_BINARY_OPS
         if arity == 3:
             return op_name in NATIVE_TERNARY_OPS
         return False
@@ -179,6 +184,8 @@ class NativeElementwiseOps:
             return self.ext.rolling1(args[0], NATIVE_ROLLING_OPS[op_name])
         if arity == 2 and op_name in NATIVE_BINARY_OPS:
             return self.ext.elementwise2(args[0], args[1], NATIVE_BINARY_OPS[op_name])
+        if arity == 2 and op_name in NATIVE_ROLLING_BINARY_OPS:
+            return self.ext.rolling2(args[0], args[1], NATIVE_ROLLING_BINARY_OPS[op_name])
         if arity == 3 and op_name in NATIVE_TERNARY_OPS:
             return self.ext.elementwise3(args[0], args[1], args[2], NATIVE_TERNARY_OPS[op_name])
         raise NotImplementedError(f"native op not supported: {op_name}/{arity}")

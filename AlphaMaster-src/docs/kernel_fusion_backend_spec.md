@@ -62,6 +62,7 @@ NEG / ABS / SIGN / POWER / SIGNED_POWER_2 / SIGNED_LOG / SQRT / CLIP / SIGMOID /
 
 二元:
 ADD / SUB / MUL / DIV / MAX / MIN
+TS_CORR_10 / COVARIANCE_10
 
 三元:
 IF_GT / GATE
@@ -112,6 +113,8 @@ EMA_20:         native 约 533.59x
 TS_DECAY_EXP_5: native 约 3.56x
 DECAY:          native 约 4.80x
 MAX3:           native 约 2.50x
+TS_CORR_10:     native 约 49.76x
+COVARIANCE_10:  native 约 23.63x
 ```
 
 注意：这是单算子速度，不等于完整训练 step 速度。完整 step 还包括采样、精英/孵化策略、打分聚合、梯度更新等环节。
@@ -138,8 +141,8 @@ PRODUCT_5: 当前 native 实现与 PyTorch 路径最大误差超过 1e-5，继�
 formulas = 192
 token_steps = 8
 bucketed launches = 185
-native executable launches = 158
-fallback launches = 27
+native executable launches = 163
+fallback launches = 22
 ```
 
 剩余 fallback 主要来自：
@@ -147,13 +150,11 @@ fallback launches = 27
 ```text
 WINSORIZE
 CS_RANK
-TS_CORR_10
 JUMP
 CS_SCALE
 SCALE
 CS_NEUTRALIZE
 TS_SKEW_10
-COVARIANCE_10
 PRODUCT_5
 ```
 
@@ -161,7 +162,7 @@ PRODUCT_5
 
 要继续接近“整轮 500-800ms”，只靠单算子还不够。后续优先级应该是：
 
-1. 扩展高频 fallback 算子，优先 `WINSORIZE / SCALE / CS_RANK / TS_CORR_10 / COVARIANCE_10`。
+1. 扩展高频 fallback 算子，优先 `WINSORIZE / CS_RANK / CS_SCALE / CS_NEUTRALIZE / TS_SKEW_10`。
 2. 做更粗粒度的 kernel fusion，减少公式 step 内多次 launch。
 3. 优化 AB 阶段，也就是 Transformer 采样、旧方向/新方向候选生成、精英或孵化策略注入。
 4. 保留 ScoreGuard，任何 native 快路径与标准路径不一致都必须 fallback。

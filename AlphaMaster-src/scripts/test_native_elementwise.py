@@ -83,6 +83,8 @@ def main() -> None:
         ("MOMENTUM_5", native.apply("MOMENTUM_5", a), _batch_op("MOMENTUM_5")(a)),
         ("MOMENTUM_10", native.apply("MOMENTUM_10", a), _batch_op("MOMENTUM_10")(a)),
         ("MAX3", native.apply("MAX3", a), _batch_op("MAX3")(a)),
+        ("TS_CORR_10", native.apply("TS_CORR_10", a, b), _batch_op("TS_CORR_10")(a, b)),
+        ("COVARIANCE_10", native.apply("COVARIANCE_10", a, b), _batch_op("COVARIANCE_10")(a, b)),
     ]
     for name, got, expected in checks:
         diff = (got - torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)).abs().max().item()
