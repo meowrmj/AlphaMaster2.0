@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=29" />
+  <link rel="stylesheet" href="/static/style.css?v=42" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -88,15 +88,78 @@
             <div class="data-file-empty">尚未选择数据文件</div>
           </div>
         </div>
-        <div class="launch-row">
-          <label class="rt-field rt-field-wide">
-            <span>评估加速模式</span>
-            <select id="evalModeSelect">
-              <option value="cpu_batch" selected>CPU batch（默认）</option>
-              <option value="cuda_batch">CUDA batch</option>
-              <option value="legacy_cpu">旧 CPU</option>
-            </select>
-          </label>
+        <div class="launch-row eval-mode-row">
+          <div class="eval-mode-card">
+            <div class="eval-mode-controls">
+              <label class="rt-field rt-field-wide">
+                <span>训练算法</span>
+                <select id="algorithmModeSelect">
+                  <option value="rl" selected>强化学习 RL</option>
+                  <option value="ga">独立遗传算法 GA</option>
+                  <option value="hybrid" disabled>混合搜索 Hybrid（预留）</option>
+                </select>
+              </label>
+              <label class="rt-field rt-field-wide">
+                <span id="evalModeLabelText">评估加速模式</span>
+                <span class="eval-mode-inline">
+                  <select id="evalModeSelect">
+                    <option value="cpu_batch" selected>CPU batch（默认）</option>
+                    <option value="cuda_batch">CUDA batch</option>
+                    <option value="legacy_cpu">旧 CPU</option>
+                  </select>
+                </span>
+              </label>
+              <details class="replay-policy-panel" id="replayPolicyPanel">
+                <summary>
+                  <span>
+                    <span class="replay-panel-title">精英/回放策略</span>
+                    <strong id="replayPolicySummary">QD + 新方向孵化</strong>
+                  </span>
+                  <span class="replay-panel-caret">展开</span>
+                </summary>
+                <div class="replay-policy-pages">
+                  <div class="replay-policy-page-head">
+                    <button type="button" class="replay-page-btn" id="replayPolicyPrevBtn" disabled>上一页</button>
+                    <span id="replayPolicyPageLabel">回放记忆 1/1</span>
+                    <button type="button" class="replay-page-btn" id="replayPolicyNextBtn" disabled>下一页</button>
+                  </div>
+                  <div class="replay-policy-page active" data-replay-page="0">
+                    <label class="replay-check">
+                      <input type="checkbox" id="replayQdCheck" data-replay-module="qd" checked />
+                      <span>
+                        <strong>QD 优秀池</strong>
+                        <small>按公式结构分桶保存优秀因子，避免只记住一种形态。</small>
+                      </span>
+                    </label>
+                    <label class="replay-check">
+                      <input type="checkbox" id="replayIncubationCheck" data-replay-module="incubation" checked />
+                      <span>
+                        <strong>新方向孵化</strong>
+                        <small>重启后的随机探索会短期保留，让弱但新鲜的方向有成长机会。</small>
+                      </span>
+                    </label>
+                  </div>
+                  <div class="replay-policy-page" data-replay-page="1">
+                    <label class="replay-check">
+                      <input type="checkbox" id="searchAnnealingCheck" data-search-module="annealing" />
+                      <span>
+                        <strong>退火局部搜索</strong>
+                        <small>围绕高分公式做扰动，偶尔接受较弱方向，尝试跳出局部最优。</small>
+                      </span>
+                    </label>
+                    <label class="replay-check">
+                      <input type="checkbox" id="searchGeneticCheck" data-search-module="genetic" />
+                      <span>
+                        <strong>遗传算法搜索</strong>
+                        <small>用种群、交叉、变异产生新公式，只参与评估和入池，不直接拉动模型梯度。</small>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              </details>
+            </div>
+            <small class="field-hint" id="evalModeHint">当前训练未运行，选择会在下次开始训练时生效。</small>
+          </div>
         </div>
         <div class="launch-actions" role="group" aria-label="训练操作">
           <button class="btn btn-primary" id="startBtn" disabled>开始训练</button>
@@ -122,6 +185,28 @@
         </div>
         <div class="chart-wrap">
           <canvas id="mainChart"></canvas>
+        </div>
+        <div class="timing-summary" id="timingSummary" hidden>
+          <div>
+            <span>最近一步</span>
+            <strong id="timingTotal">—</strong>
+          </div>
+          <div>
+            <span>采样/精英</span>
+            <strong id="timingAB">—</strong>
+          </div>
+          <div>
+            <span>评估</span>
+            <strong id="timingEval">—</strong>
+          </div>
+          <div>
+            <span>梯度</span>
+            <strong id="timingGrad">—</strong>
+          </div>
+          <div>
+            <span>杂项</span>
+            <strong id="timingRest">—</strong>
+          </div>
         </div>
         <details class="chart-metrics-help" open>
           <summary>指标说明</summary>
@@ -612,6 +697,6 @@
   </div>
 
   <script src="/static/bg.js?v=1"></script>
-  <script src="/static/app.js?v=81"></script>
+  <script src="/static/app.js?v=103"></script>
 </body>
 </html>

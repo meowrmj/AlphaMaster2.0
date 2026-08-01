@@ -47,7 +47,13 @@ from web.strategy_file import (
     strategy_path_for_symbol,
     sync_best_strategy_for_symbol,
 )
-from web.training_manager import training_manager
+from web.training_manager import (
+    _normalize_algorithm_mode,
+    _normalize_eval_mode,
+    _normalize_replay_config,
+    _normalize_search_config,
+    training_manager,
+)
 from web.training_time import get_training_time_summary
 from web.training_package import build_training_export_zip, import_training_package
 from web.backtest_manager import backtest_manager
@@ -93,7 +99,17 @@ def _with_relative_strategy_file(info: dict[str, Any]) -> dict[str, Any]:
 class StartTrainingRequest(BaseModel):
     data_file: str
     from_scratch: bool = False
+    algorithm_mode: str = "rl"
     eval_mode: str = "cpu_batch"
+    replay_policy: Any = "qd_incubation"
+    search_plugins: Any = None
+
+
+class ApplyEvalModeRequest(BaseModel):
+    algorithm_mode: str = "rl"
+    eval_mode: str = "cpu_batch"
+    replay_policy: Any = "qd_incubation"
+    search_plugins: Any = None
 
 
 class ClientLogRequest(BaseModel):
@@ -241,7 +257,7 @@ def _browse_data_file() -> dict[str, Any]:
                 job.get("data_file"),
                 info.get("data_file"),
             )
-        stopped = training_manager.stop()
+        stopped = training_manager.stop("data_file_changed")
         stopped_training = {
             "ok": stopped,
             "previous_data_file": job.get("data_file"),
@@ -348,6 +364,9 @@ def _infer_data_file_from_name(path: Path) -> dict[str, Any] | None:
         "15min": "M15",
         "15m": "M15",
         "m15": "M15",
+        "5min": "M5",
+        "5m": "M5",
+        "m5": "M5",
         "60min": "H1",
         "1h": "H1",
         "h1": "H1",
@@ -401,8 +420,14 @@ def _list_local_parquet_files(symbol_filter: str | None = None, limit: int = 200
     return rows
 
 
-def _write_current_run_strategy(symbol: str, timeframe: str | None, data_file: str | None = None) -> dict[str, Any] | None:
-    ckpts = checkpoint_glob(symbol, timeframe)
+def _write_current_run_strategy(
+    symbol: str,
+    timeframe: str | None,
+    data_file: str | None = None,
+    algorithm_mode: str = "rl",
+) -> dict[str, Any] | None:
+    algorithm = algorithm_mode if algorithm_mode in {"rl", "ga", "hybrid"} else "rl"
+    ckpts = checkpoint_glob(symbol, timeframe, algorithm)
     if not ckpts:
         return None
     latest = ckpts[-1]
@@ -413,7 +438,8 @@ def _write_current_run_strategy(symbol: str, timeframe: str | None, data_file: s
         return None
     tf = str(timeframe or "").strip().upper() or None
     suffix = symbol.replace(".", "_") + (f"_{tf}" if tf else "")
-    out_path = STRATEGIES_DIR / f"current_run_best_{suffix}.json"
+    out_path = STRATEGIES_DIR / "runs" / algorithm / f"current_run_best_{algorithm}_{suffix}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "vocab_version": "checkpoint",
         "symbol": symbol,
@@ -423,6 +449,8 @@ def _write_current_run_strategy(symbol: str, timeframe: str | None, data_file: s
         "best_score": float(score),
         "train_step": int(meta.get("step") or 0),
         "source": "current_run_checkpoint",
+        "strategy_source": "current_run",
+        "algorithm_mode": algorithm,
         "checkpoint_path": str(latest.relative_to(ROOT)).replace("\\", "/"),
     }
     if data_file:
@@ -501,6 +529,7 @@ def _sync_and_persist_best_strategy(
         hint = load_settings().get("last_data_file") or None
     timeframe = None
     job = training_manager.status().get("job") or {}
+    algorithm_mode = str(job.get("algorithm_mode") or "rl").strip().lower()
     if str(job.get("symbol") or "") == symbol and job.get("timeframe"):
         timeframe = str(job.get("timeframe") or "").strip().upper() or None
     if hint:
@@ -508,7 +537,12 @@ def _sync_and_persist_best_strategy(
             timeframe = timeframe or inspect_parquet_file(hint).get("timeframe")
         except Exception:
             pass
-    info = sync_best_strategy_for_symbol(symbol, data_file_hint=hint, timeframe=timeframe)
+    info = sync_best_strategy_for_symbol(
+        symbol,
+        data_file_hint=hint,
+        timeframe=timeframe,
+        algorithm_mode=algorithm_mode,
+    )
     if info:
         rel_info = _with_relative_strategy_file(info)
         save_settings({"last_strategy_file": rel_info["strategy_file"]})
@@ -707,15 +741,30 @@ def api_backtest_options(symbol: str | None = None) -> dict[str, Any]:
     data_files = _list_local_parquet_files(wanted_symbol)
     strategies = []
     for s in list_strategies():
+        source = s.get("strategy_source")
+        if source == "current_run":
+            continue
         path = Path(str(s.get("file") or ""))
         if not path.is_absolute():
             path = (STRATEGIES_DIR / path).resolve()
         if not path.exists():
             continue
+        source_label = {
+            "legacy": "旧共享策略",
+            "production": "生产策略",
+            "champion": "保存冠军",
+        }.get(str(source or ""), "保存策略")
         strategies.append(
             {
                 "kind": "saved",
-                "label": f"{s.get('symbol')} {s.get('display_timeframe') or s.get('timeframe') or '未标注'} · 保存冠军 · 分数 {float(s.get('best_score') or 0):.3f}",
+                "algorithm_mode": s.get("algorithm_mode"),
+                "strategy_source": source,
+                "label": (
+                    f"{s.get('symbol')} {s.get('display_timeframe') or s.get('timeframe') or '未标注'} · "
+                    f"{str(s.get('algorithm_mode') or '未知').upper()} · "
+                    f"{source_label} · "
+                    f"分数 {float(s.get('best_score') or 0):.3f}"
+                ),
                 "strategy_file": _project_relative_path(path),
                 "symbol": s.get("symbol"),
                 "timeframe": s.get("display_timeframe") or s.get("timeframe"),
@@ -727,20 +776,23 @@ def api_backtest_options(symbol: str | None = None) -> dict[str, Any]:
     for df in data_files:
         sym = str(df.get("symbol") or "")
         tf = str(df.get("timeframe") or "").strip().upper() or None
-        cur = _write_current_run_strategy(sym, tf, df.get("data_file"))
-        if not cur:
-            continue
-        strategies.append(
-            {
-                "kind": "current_run",
-                "label": f"{sym} {tf or ''} · 本轮最优 checkpoint · 分数 {float(cur.get('best_score') or 0):.3f}",
-                "strategy_file": cur.get("strategy_file"),
-                "symbol": sym,
-                "timeframe": tf,
-                "best_score": cur.get("best_score"),
-                "formula_decoded": cur.get("formula_decoded"),
-            }
-        )
+        for algorithm in ("rl", "ga"):
+            cur = _write_current_run_strategy(sym, tf, df.get("data_file"), algorithm)
+            if not cur:
+                continue
+            strategies.append(
+                {
+                    "kind": "current_run",
+                    "algorithm_mode": algorithm,
+                    "strategy_source": "current_run",
+                    "label": f"{sym} {tf or ''} · {algorithm.upper()} 本轮最优 checkpoint · 分数 {float(cur.get('best_score') or 0):.3f}",
+                    "strategy_file": cur.get("strategy_file"),
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "best_score": cur.get("best_score"),
+                    "formula_decoded": cur.get("formula_decoded"),
+                }
+            )
 
     strategies.sort(key=lambda r: (str(r.get("symbol") or ""), str(r.get("timeframe") or ""), str(r.get("kind") or "")))
     return {
@@ -767,8 +819,9 @@ def _progress_with_live_step(
     symbol: str,
     active: bool,
     timeframe: str | None = None,
+    algorithm_mode: str | None = None,
 ) -> dict[str, Any]:
-    p = get_symbol_progress(symbol, timeframe)
+    p = get_symbol_progress(symbol, timeframe, algorithm_mode)
     current_step = p.current_step
     if active:
         live = training_manager.parse_step_from_log()
@@ -841,8 +894,14 @@ def _attach_training_time(
     return row
 
 
+def _normalize_algorithm_mode_for_view(mode: str | None) -> str:
+    mode = str(mode or "rl").strip().lower()
+    return mode if mode in {"rl", "ga", "hybrid"} else "rl"
+
+
 @app.get("/api/overview")
-def api_overview() -> dict[str, Any]:
+def api_overview(algorithm_mode: str | None = None) -> dict[str, Any]:
+    requested_algorithm = _normalize_algorithm_mode_for_view(algorithm_mode)
     settings = load_settings()
     data_file = settings.get("last_data_file") or ""
     file_info = None
@@ -856,9 +915,15 @@ def api_overview() -> dict[str, Any]:
         try:
             file_info = inspect_parquet_file(data_file)
             sym = file_info.get("symbol")
-            row = _progress_with_live_step(sym, active=False, timeframe=file_info.get("timeframe"))
+            row = _progress_with_live_step(
+                sym,
+                active=False,
+                timeframe=file_info.get("timeframe"),
+                algorithm_mode=requested_algorithm,
+            )
             progress = {
                 "symbol": row["symbol"],
+                "algorithm_mode": requested_algorithm,
                 "timeframe": file_info.get("timeframe"),
                 "status": row["status"],
                 "current_step": row["current_step"],
@@ -885,30 +950,38 @@ def api_overview() -> dict[str, Any]:
 
     if job and job.get("symbol") and active:
         sym = job["symbol"]
-        row = _progress_with_live_step(sym, active=True, timeframe=job.get("timeframe"))
-        progress = {
-            "symbol": row["symbol"],
-            "timeframe": job.get("timeframe"),
-            "status": "running_job",
-            "current_step": row["current_step"],
-            "train_steps": row["train_steps"],
-            "progress_pct": row["progress_pct"],
-            "best_score": row["best_score"],
-            "val_score": row.get("val_score"),
-            "champion_score": row.get("champion_score"),
-            "candidate_val_score": row.get("candidate_val_score"),
-            "stagnation_steps": row.get("stagnation_steps"),
-            "formula_decoded": row["formula_decoded"],
-            "has_checkpoint": row.get("has_checkpoint", False),
-            "has_strategy": row.get("has_strategy", False),
-        }
-        progress = _attach_training_time(
-            progress,
-            symbol=sym,
-            timeframe=job.get("timeframe"),
-            job=job,
-            active=True,
-        )
+        active_algorithm = _normalize_algorithm_mode_for_view(job.get("algorithm_mode"))
+        if active_algorithm == requested_algorithm:
+            row = _progress_with_live_step(
+                sym,
+                active=True,
+                timeframe=job.get("timeframe"),
+                algorithm_mode=active_algorithm,
+            )
+            progress = {
+                "symbol": row["symbol"],
+                "algorithm_mode": active_algorithm,
+                "timeframe": job.get("timeframe"),
+                "status": "running_job",
+                "current_step": row["current_step"],
+                "train_steps": row["train_steps"],
+                "progress_pct": row["progress_pct"],
+                "best_score": row["best_score"],
+                "val_score": row.get("val_score"),
+                "champion_score": row.get("champion_score"),
+                "candidate_val_score": row.get("candidate_val_score"),
+                "stagnation_steps": row.get("stagnation_steps"),
+                "formula_decoded": row["formula_decoded"],
+                "has_checkpoint": row.get("has_checkpoint", False),
+                "has_strategy": row.get("has_strategy", False),
+            }
+            progress = _attach_training_time(
+                progress,
+                symbol=sym,
+                timeframe=job.get("timeframe"),
+                job=job,
+                active=True,
+            )
 
     return {
         "data_file": file_info,
@@ -918,7 +991,12 @@ def api_overview() -> dict[str, Any]:
 
 
 @app.get("/api/symbols/{symbol}")
-def api_symbol(symbol: str, timeframe: str | None = None) -> dict[str, Any]:
+def api_symbol(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> dict[str, Any]:
+    requested_algorithm = _normalize_algorithm_mode_for_view(algorithm_mode)
     tf = str(timeframe or "").strip().upper() or None
     if not tf:
         job = training_manager.status().get("job") or {}
@@ -933,9 +1011,10 @@ def api_symbol(symbol: str, timeframe: str | None = None) -> dict[str, Any]:
                     tf = str(info.get("timeframe") or "").strip().upper() or None
             except Exception:
                 pass
-    p = get_symbol_progress(symbol, tf)
+    p = get_symbol_progress(symbol, tf, requested_algorithm)
     return {
         "symbol": p.symbol,
+        "algorithm_mode": requested_algorithm,
         "timeframe": tf,
         "status": p.status,
         "current_step": p.current_step,
@@ -1045,7 +1124,10 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
             timeframe=info["timeframe"],
             mode="ftmo",
             from_scratch=bool(req.from_scratch),
+            algorithm_mode=req.algorithm_mode,
             eval_mode=req.eval_mode,
+            replay_policy=req.replay_policy,
+            search_plugins=req.search_plugins,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
@@ -1056,7 +1138,9 @@ def api_training_start(req: StartTrainingRequest) -> dict[str, Any]:
         "job": job.to_dict(),
         "data_file": info,
         "from_scratch": bool(req.from_scratch),
+        "algorithm_mode": job.algorithm_mode,
         "eval_mode": job.eval_mode,
+        "replay_policy": job.replay_policy,
     }
 
 
@@ -1065,7 +1149,7 @@ def api_training_stop() -> dict[str, Any]:
     job = training_manager.status().get("job") or {}
     symbol = job.get("symbol")
     data_file_hint = job.get("data_file")
-    stopped = training_manager.stop()
+    stopped = training_manager.stop("api_training_stop")
     strategy_file = None
     if symbol:
         _wait_training_idle()
@@ -1077,6 +1161,129 @@ def api_training_stop() -> dict[str, Any]:
         "ok": stopped,
         "training": training_manager.status(),
         "strategy_file": strategy_file,
+    }
+
+
+@app.post("/api/training/apply-eval-mode")
+def api_training_apply_eval_mode(req: ApplyEvalModeRequest) -> dict[str, Any]:
+    status = training_manager.status()
+    job = status.get("job") or {}
+    if not status.get("active") or not job:
+        raise HTTPException(409, "当前没有正在运行的训练任务")
+
+    data_file = job.get("data_file")
+    symbol = job.get("symbol")
+    timeframe = job.get("timeframe")
+    mode = job.get("mode") or "ftmo"
+    old_eval_mode = job.get("eval_mode")
+    old_algorithm_mode = job.get("algorithm_mode")
+    old_replay_policy = job.get("replay_policy")
+    if not data_file or not symbol or not timeframe:
+        raise HTTPException(409, "当前训练任务缺少数据文件或品种周期信息，无法安全切换")
+
+    next_algorithm_mode = _normalize_algorithm_mode(req.algorithm_mode)
+    next_eval_mode = _normalize_eval_mode(req.eval_mode)
+    next_replay_policy, next_replay_config = _normalize_replay_config(req.replay_policy)
+    next_search_config = _normalize_search_config(req.search_plugins)
+    current_algorithm_mode = _normalize_algorithm_mode(old_algorithm_mode)
+    current_eval_mode = _normalize_eval_mode(old_eval_mode)
+    current_replay_policy, current_replay_config = _normalize_replay_config(
+        job.get("replay_config") or old_replay_policy
+    )
+    current_search_config = _normalize_search_config(job.get("search_config"))
+    if current_algorithm_mode != next_algorithm_mode:
+        try:
+            stopped = training_manager.stop_after_checkpoint("algorithm_mode_changed")
+        except TimeoutError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        _wait_training_idle()
+        invalidate_checkpoint_cache()
+        strategy_sync_warning = None
+        try:
+            _sync_and_persist_best_strategy(symbol, data_file_hint=data_file)
+        except OSError as exc:
+            strategy_sync_warning = f"切换算法时同步策略文件失败，已停止当前训练: {exc}"
+            log_error(strategy_sync_warning, exc)
+        return {
+            "ok": True,
+            "stopped": stopped,
+            "restarted": False,
+            "algorithm_switched": True,
+            "old_eval_mode": old_eval_mode,
+            "old_algorithm_mode": old_algorithm_mode,
+            "old_replay_policy": old_replay_policy,
+            "algorithm_mode": next_algorithm_mode,
+            "eval_mode": next_eval_mode,
+            "replay_policy": next_replay_policy,
+            "job": None,
+            "training": training_manager.status(),
+            "data_file": _inspect_or_http(data_file),
+            "warning": strategy_sync_warning,
+        }
+    unchanged = (
+        current_algorithm_mode == next_algorithm_mode
+        and current_eval_mode == next_eval_mode
+        and current_replay_config == next_replay_config
+        and current_search_config == next_search_config
+    )
+    if unchanged:
+        return {
+            "ok": True,
+            "stopped": False,
+            "restarted": False,
+            "unchanged": True,
+            "old_eval_mode": old_eval_mode,
+            "old_algorithm_mode": old_algorithm_mode,
+            "old_replay_policy": old_replay_policy,
+            "algorithm_mode": current_algorithm_mode,
+            "eval_mode": current_eval_mode,
+            "replay_policy": current_replay_policy,
+            "job": job,
+            "data_file": _inspect_or_http(data_file),
+            "warning": None,
+        }
+
+    try:
+        stopped = training_manager.stop_after_checkpoint("apply_eval_mode_changed")
+    except TimeoutError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _wait_training_idle()
+    invalidate_checkpoint_cache()
+    strategy_sync_warning = None
+    try:
+        _sync_and_persist_best_strategy(symbol, data_file_hint=data_file)
+    except OSError as exc:
+        strategy_sync_warning = f"切换模式时同步策略文件失败，已继续切换训练: {exc}"
+        log_error(strategy_sync_warning, exc)
+
+    info = _inspect_or_http(data_file)
+    try:
+        new_job = training_manager.start(
+            data_file=info["data_file"],
+            symbol=symbol,
+            timeframe=timeframe,
+            mode=mode,
+            from_scratch=False,
+            algorithm_mode=next_algorithm_mode,
+            eval_mode=next_eval_mode,
+            replay_policy=next_replay_config,
+            search_plugins=next_search_config,
+        )
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+
+    return {
+        "ok": True,
+        "stopped": stopped,
+        "old_eval_mode": old_eval_mode,
+        "old_algorithm_mode": old_algorithm_mode,
+        "old_replay_policy": old_replay_policy,
+        "algorithm_mode": new_job.algorithm_mode,
+        "eval_mode": new_job.eval_mode,
+        "replay_policy": new_job.replay_policy,
+        "job": new_job.to_dict(),
+        "data_file": info,
+        "warning": strategy_sync_warning,
     }
 
 

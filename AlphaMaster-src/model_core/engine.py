@@ -6,6 +6,7 @@ import os
 import pathlib
 import random
 import sys
+import time
 
 import torch
 
@@ -32,6 +33,9 @@ from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
 from .vm import StackVM
 from .backtest import MT5Backtest, estimate_periods_per_year
 from .vocab import FORMULA_VOCAB, VOCAB_VERSION, VocabVersionMismatchError  # task 12.2
+from .replay_policies import build_replay_policy, formula_bucket_key
+from .search_plugins import SearchPluginManager
+from .training_control import acknowledge_checkpoint_stop, read_checkpoint_stop_request
 
 # P3：冠军在场时间稳健性校验所需
 try:
@@ -63,7 +67,11 @@ def _artifact_suffix(symbol: str | None, timeframe: str | None = None) -> str:
     return suffix
 
 
-def _strategy_file_for_symbol(symbol: str | None, timeframe: str | None = None) -> str:
+def _strategy_file_for_symbol(
+    symbol: str | None,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> str:
     """返回该品种对应的策略文件路径。
 
     单品种训练时使用 strategies/best_{symbol}.json，
@@ -71,7 +79,10 @@ def _strategy_file_for_symbol(symbol: str | None, timeframe: str | None = None) 
     """
     suffix = _artifact_suffix(symbol, timeframe)
     if suffix:
-        return str(pathlib.Path("strategies") / f"best_{suffix}.json")
+        mode = str(algorithm_mode or "rl").strip().lower()
+        if mode not in {"rl", "ga", "hybrid"}:
+            mode = "rl"
+        return str(pathlib.Path("strategies") / "champions" / mode / f"best_{mode}_{suffix}.json")
     return _STRATEGY_FILE
 
 
@@ -181,6 +192,7 @@ class ConstrainedSampler:
                 self.infected_propagating_ids.add(tid)
             if cfg[0] in SIGN_RESTORE_OPS:
                 self.sign_restore_ids.add(tid)
+        self._valid_mask_cache: dict[tuple[str, int, int, int, int | None, int], torch.Tensor] = {}
 
     def valid_mask(self, stack_depth: int, step_idx: int,
                    total_steps: int, device: torch.device,
@@ -216,14 +228,18 @@ class ConstrainedSampler:
     def apply_mask_to_logits(self, logits: torch.Tensor, stack_depths: list[int],
                               step_idx: int, total_steps: int,
                               prev_tokens: list[int | None] | None = None,
-                              infected_chain_lens: list[int] | None = None) -> torch.Tensor:
+        infected_chain_lens: list[int] | None = None) -> torch.Tensor:
         masked = logits.clone()
         device = logits.device
         for b, depth in enumerate(stack_depths):
             prev_t = prev_tokens[b] if prev_tokens else None
             icl = infected_chain_lens[b] if infected_chain_lens else 0
-            vmask = self.valid_mask(depth, step_idx, total_steps, device,
-                                    prev_token=prev_t, infected_chain_len=icl)
+            key = (str(device), int(depth), int(step_idx), int(total_steps), prev_t, int(icl))
+            vmask = self._valid_mask_cache.get(key)
+            if vmask is None:
+                vmask = self.valid_mask(depth, step_idx, total_steps, device,
+                                        prev_token=prev_t, infected_chain_len=icl)
+                self._valid_mask_cache[key] = vmask
             masked[b][~vmask] = -1e9
         return masked
 
@@ -272,6 +288,7 @@ class AlphaEngine:
         self.vm = StackVM()
         self.bt = MT5Backtest()
         self._batch_pipeline = None
+        self._evaluator_router = None
 
         from .vocab import FORMULA_VOCAB as _v
         self.sampler = ConstrainedSampler(
@@ -296,6 +313,11 @@ class AlphaEngine:
         # Elite Replay pool: (val_score, counter, formula_tokens, birth_step)
         self._elite_pool: list[tuple[float, int, list[int], int]] = []
         self._elite_counter = 0
+        self._incubation_pool: list[tuple[float, int, list[int], int]] = []
+        self._incubation_counter = 0
+        self.replay_policy = build_replay_policy()
+        self.search_plugins = SearchPluginManager(self.sampler)
+        self._last_restart_step = -10**9
 
         # 自适应噪声：记录 best 刷新步数
         self._best_update_step = 0
@@ -344,9 +366,16 @@ class AlphaEngine:
             max_workers=workers,
             thread_name_prefix="alpha-eval",
         )
-        print(f"[ParallelEval] workers={workers} intra_threads={intra} "
-              f"(physical_cores={phys})  pool={'ON' if workers > 1 else 'OFF'}",
-              flush=True)
+        if ModelConfig.GPU_BATCH_EVAL:
+            print(
+                f"[EvalMode] batch evaluator enabled device={ModelConfig.DEVICE} "
+                f"intra_threads={intra}; legacy formula pool is bypassed during walk-forward eval",
+                flush=True,
+            )
+        else:
+            print(f"[ParallelEval] workers={workers} intra_threads={intra} "
+                  f"(physical_cores={phys})  pool={'ON' if workers > 1 else 'OFF'}",
+                  flush=True)
 
     # ── 单条公式评估任务（线程安全）───────────────────────────────────────
 
@@ -466,7 +495,34 @@ class AlphaEngine:
             self._batch_pipeline.bt.periods_per_year = self.bt.periods_per_year
         return self._batch_pipeline
 
-    def _eval_formula_batch_tasks(
+    def _get_evaluator_router(self):
+        from .evaluation_engines import (
+            EvaluatorRouter,
+            FastBatchFormulaEvaluator,
+            ScoreGuard,
+            StandardFormulaEvaluator,
+        )
+        if self._evaluator_router is None:
+            standard = StandardFormulaEvaluator(self._eval_formula_task)
+            fast = FastBatchFormulaEvaluator(self._eval_formula_batch_tasks_impl)
+            guard = None
+            if ModelConfig.EVALUATOR_GUARD and not ModelConfig.GPU_BATCH_EVAL:
+                guard = ScoreGuard(
+                    standard,
+                    sample_size=ModelConfig.EVALUATOR_GUARD_SAMPLE,
+                    every_n_steps=ModelConfig.EVALUATOR_GUARD_EVERY,
+                    score_tol=ModelConfig.EVALUATOR_SCORE_TOL,
+                    factor_tol=ModelConfig.EVALUATOR_FACTOR_TOL,
+                )
+            self._evaluator_router = EvaluatorRouter(
+                standard=standard,
+                fast=fast,
+                guard=guard,
+                mode=ModelConfig.EVALUATOR_ENGINE,
+            )
+        return self._evaluator_router
+
+    def _eval_formula_batch_tasks_impl(
         self,
         formulas: list[list[int]],
         feat: torch.Tensor,
@@ -485,7 +541,8 @@ class AlphaEngine:
 
             train_scores = torch.zeros(len(formulas), device=feat.device)
             val_scores = torch.zeros(len(formulas), device=feat.device)
-            ic_by_formula = [[] for _ in formulas]
+            ic_sum = torch.zeros(len(formulas), device=feat.device)
+            ic_count = torch.zeros(len(formulas), device=feat.device)
 
             with torch.no_grad():
                 for fold in folds:
@@ -495,36 +552,45 @@ class AlphaEngine:
                         fold["train_start"], fold["train_end"],
                         fold["val_start"], fold["val_end"],
                     )
-                    for i in range(len(formulas)):
-                        if not bool(valid[i]):
-                            continue
-                        res = factors[i]
-                        ic_m, _ = AlphaEngine._compute_ic(
-                            res[:, fold["train_start"]:fold["train_end"]],
-                            t_ret[:, fold["train_start"]:fold["train_end"]],
-                        )
-                        ic_v, _ = AlphaEngine._compute_ic(
-                            res[:, fold["val_start"]:fold["val_end"]],
-                            t_ret[:, fold["val_start"]:fold["val_end"]],
-                        )
-                        train_scores[i] += ModelConfig.REWARD_ALPHA * AlphaEngine._apply_ic_gate(
-                            scores.train_scores[i], ic_m
-                        )
-                        val_scores[i] += AlphaEngine._apply_ic_gate(scores.val_scores[i], ic_v)
-                        ic_by_formula[i].append(ic_m.item())
+                    ic_m, ic_m_valid = AlphaEngine._compute_ic_mean_batch(
+                        factors[:, :, fold["train_start"]:fold["train_end"]],
+                        t_ret[:, fold["train_start"]:fold["train_end"]],
+                    )
+                    ic_v, _ = AlphaEngine._compute_ic_mean_batch(
+                        factors[:, :, fold["val_start"]:fold["val_end"]],
+                        t_ret[:, fold["val_start"]:fold["val_end"]],
+                    )
+                    active = valid
+                    train_scores += torch.where(
+                        valid,
+                        ModelConfig.REWARD_ALPHA * AlphaEngine._apply_ic_gate(scores.train_scores, ic_m),
+                        torch.zeros_like(train_scores),
+                    )
+                    val_scores += torch.where(
+                        valid,
+                        AlphaEngine._apply_ic_gate(scores.val_scores, ic_v),
+                        torch.zeros_like(val_scores),
+                    )
+                    ic_sum += torch.where(active, ic_m, torch.zeros_like(ic_m))
+                    ic_count += active.to(ic_count.dtype)
                 train_scores = train_scores / max(1, len(folds))
                 val_scores = val_scores / max(1, len(folds))
+                ic_full_batch, ic_stab_batch = AlphaEngine._compute_ic_batch(factors, t_ret)
+                factor_std = factors.reshape(factors.shape[0], -1).std(dim=1)
+                valid_cpu = valid.detach().cpu().tolist()
+                const_cpu = (factor_std < 1e-4).detach().cpu().tolist()
 
             corr_slice = (folds[0]["train_start"], folds[0]["train_end"])
+            corr_penalty_cpu = self._corr_penalty_mask_batch(factors, corr_slice).detach().cpu().tolist()
             results: list[dict] = []
             for i, fml in enumerate(formulas):
-                if not bool(valid[i]):
+                if not valid_cpu[i]:
                     results.append({'idx': i, 'status': 'none', 'reward': -5.0,
                                     'val_score': -5.0, 'fml': fml})
                     continue
 
                 res = factors[i]
-                if res.std() < 1e-4:
+                if const_cpu[i]:
                     results.append({'idx': i, 'status': 'const', 'reward': -2.0,
                                     'val_score': -2.0, 'fml': fml})
                     continue
@@ -536,16 +602,15 @@ class AlphaEngine:
                     reward = reward - rp
                     val_score_out = val_score_out - rp
 
-                reward = self._apply_corr_penalty(reward, res, corr_slice)
-                val_score_out = self._apply_corr_penalty(val_score_out, res, corr_slice)
-                ic_full, ic_stab_full = AlphaEngine._compute_ic(res, t_ret)
-                ic_values = ic_by_formula[i]
-                ic_i = sum(ic_values) / len(ic_values) if ic_values else 0.0
+                if corr_penalty_cpu[i]:
+                    reward = reward * ModelConfig.CORR_PENALTY
+                    val_score_out = val_score_out * ModelConfig.CORR_PENALTY
+                ic_i = (ic_sum[i] / ic_count[i].clamp(min=1)).item()
                 results.append({
                     'idx': i, 'status': 'ok',
                     'reward': reward.item() if isinstance(reward, torch.Tensor) else float(reward),
                     'val_score': val_score_out.item() if isinstance(val_score_out, torch.Tensor) else float(val_score_out),
-                    'ic_full': ic_full.item(), 'ic_stab': ic_stab_full.item(),
+                    'ic_full': ic_full_batch[i].item(), 'ic_stab': ic_stab_batch[i].item(),
                     'ic_i': ic_i, 'res': res, 'fml': fml,
                 })
             return results
@@ -556,6 +621,29 @@ class AlphaEngine:
                 self._eval_formula_task(i, fml, feat, t_ret, folds, use_wf, factor_pool_snapshot)
                 for i, fml in enumerate(formulas)
             ]
+
+    def _eval_formula_batch_tasks(
+        self,
+        step: int,
+        formulas: list[list[int]],
+        feat: torch.Tensor,
+        t_ret: torch.Tensor,
+        folds: list[dict],
+        use_wf: bool,
+        factor_pool_snapshot: list,
+    ) -> list[dict]:
+        """Evaluate one training step through the pluggable evaluator router."""
+        router = self._get_evaluator_router()
+        return router.evaluate(
+            step=step,
+            formulas=formulas,
+            feat=feat,
+            t_ret=t_ret,
+            folds=folds,
+            use_wf=use_wf,
+            factor_pool_snapshot=factor_pool_snapshot,
+            prefer_fast=bool(ModelConfig.GPU_BATCH_EVAL and use_wf),
+        )
 
     @staticmethod
     def _compute_ic(factor: torch.Tensor, target_ret: torch.Tensor
@@ -596,12 +684,76 @@ class AlphaEngine:
     # ── IC gate: direction-based, dimension-agnostic ──────────────────────────
 
     @staticmethod
+    def _compute_ic_batch(
+        factors: torch.Tensor,
+        target_ret: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch version of _compute_ic for factors shaped [B,N,T]."""
+        if factors.ndim != 3:
+            raise ValueError(f"factors must be [B,N,T], got {tuple(factors.shape)}")
+        bsz = factors.shape[0]
+        if factors.shape[2] < 2:
+            z = torch.zeros(bsz, device=factors.device, dtype=factors.dtype)
+            return z, z
+
+        x = factors[:, :, :-1]
+        y = target_ret[None, :, 1:].expand_as(x)
+        xm = x - x.mean(dim=2, keepdim=True)
+        ym = y - y.mean(dim=2, keepdim=True)
+        sx = xm.square().mean(dim=2).sqrt()
+        sy = ym.square().mean(dim=2).sqrt()
+        valid = (sx >= 1e-6) & (sy >= 1e-6)
+        ic = (xm * ym).mean(dim=2) / (sx * sy + 1e-8)
+        ic = torch.where(valid, ic, torch.zeros_like(ic))
+        denom = valid.sum(dim=1).clamp(min=1)
+        ic_mean = ic.sum(dim=1) / denom
+        centered = torch.where(valid, ic - ic_mean[:, None], torch.zeros_like(ic))
+        ic_std = (centered.square().sum(dim=1) / denom).sqrt()
+        ic_stab = torch.where(
+            valid.sum(dim=1) >= 2,
+            ic_mean / (ic_std + 1e-6),
+            torch.zeros_like(ic_mean),
+        )
+        return ic_mean, ic_stab
+
+    @staticmethod
+    def _compute_ic_mean_batch(
+        factors: torch.Tensor,
+        target_ret: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return batch IC mean and whether each formula had any valid symbol."""
+        if factors.ndim != 3:
+            raise ValueError(f"factors must be [B,N,T], got {tuple(factors.shape)}")
+        bsz = factors.shape[0]
+        if factors.shape[2] < 2:
+            z = torch.zeros(bsz, device=factors.device, dtype=factors.dtype)
+            return z, torch.zeros(bsz, device=factors.device, dtype=torch.bool)
+        x = factors[:, :, :-1]
+        y = target_ret[None, :, 1:].expand_as(x)
+        xm = x - x.mean(dim=2, keepdim=True)
+        ym = y - y.mean(dim=2, keepdim=True)
+        sx = xm.square().mean(dim=2).sqrt()
+        sy = ym.square().mean(dim=2).sqrt()
+        valid = (sx >= 1e-6) & (sy >= 1e-6)
+        ic = (xm * ym).mean(dim=2) / (sx * sy + 1e-8)
+        ic = torch.where(valid, ic, torch.zeros_like(ic))
+        denom = valid.sum(dim=1).clamp(min=1)
+        return ic.sum(dim=1) / denom, valid.any(dim=1)
+
+    @staticmethod
     def _apply_ic_gate(reward: torch.Tensor, ic_mean) -> torch.Tensor:
         """IC 门控：用 IC 符号而非量值调整 reward，完全规避量纲问题。
         IC > thresh  → reward × IC_GATE_MULT  (正向预测，奖励)
         IC < -thresh → reward × IC_NEG_MULT   (反向预测，惩罚)
         |IC| ≤ thresh→ 不修改                  (噪声区)
         """
+        if isinstance(ic_mean, torch.Tensor) and ic_mean.numel() > 1:
+            t = ModelConfig.IC_GATE_THRESH
+            return torch.where(
+                ic_mean > t,
+                reward * ModelConfig.IC_GATE_MULT,
+                torch.where(ic_mean < -t, reward * ModelConfig.IC_NEG_MULT, reward),
+            )
         ic_val = ic_mean.item() if isinstance(ic_mean, torch.Tensor) else float(ic_mean)
         t = ModelConfig.IC_GATE_THRESH
         if ic_val > t:
@@ -614,45 +766,160 @@ class AlphaEngine:
     # ── Elite pool ────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _elite_bucket_key(formula: list[int]) -> tuple:
+        """Group similar formulas so the elite pool keeps several directions."""
+        op_offset = getattr(FORMULA_VOCAB, "operator_offset", 0)
+        names = FORMULA_VOCAB.token_names
+        first = int(formula[0]) if formula else -1
+        feat_cnt = sum(1 for t in formula if t < op_offset)
+        ts_cnt = arith_cnt = norm_cnt = nonlinear_cnt = 0
+        for t in formula:
+            name = names[t] if 0 <= t < len(names) else ""
+            if name.startswith("TS_") or name in {"DELAY", "DELTA", "DECAY_LINEAR_5", "PRODUCT_5"}:
+                ts_cnt += 1
+            if name in {"ADD", "SUB", "MUL", "DIV", "NEG"}:
+                arith_cnt += 1
+            if "ZSCORE" in name or "RANK" in name or "SCALE" in name or "NORMALIZE" in name:
+                norm_cnt += 1
+            if name in {"SIGNED_LOG", "TANH_SQUASH", "SIGMOID", "ABS", "SQRT"}:
+                nonlinear_cnt += 1
+        return (first, min(feat_cnt, 3), min(ts_cnt, 3), min(arith_cnt, 2), min(norm_cnt, 2), min(nonlinear_cnt, 2))
+
+    @classmethod
+    def _rebalance_elite_pool(
+        cls,
+        pool: list[tuple[float, int, list[int], int]],
+    ) -> list[tuple[float, int, list[int], int]]:
+        bucket_cap = max(1, int(getattr(ModelConfig, "ELITE_BUCKET_CAP", 3)))
+        global_cap = max(1, int(ModelConfig.ELITE_POOL_SIZE))
+        by_formula: dict[tuple[int, ...], tuple[float, int, list[int], int]] = {}
+        for sc, cnt, toks, birth in pool:
+            key = tuple(int(t) for t in toks)
+            entry = (float(sc), int(cnt), [int(t) for t in toks], int(birth))
+            if key not in by_formula or entry[0] > by_formula[key][0]:
+                by_formula[key] = entry
+        buckets: dict[tuple, list[tuple[float, int, list[int], int]]] = {}
+        for entry in by_formula.values():
+            buckets.setdefault(cls._elite_bucket_key(entry[2]), []).append(entry)
+        kept: list[tuple[float, int, list[int], int]] = []
+        for entries in buckets.values():
+            kept.extend(sorted(entries, key=lambda x: (x[0], x[1]), reverse=True)[:bucket_cap])
+        kept = sorted(kept, key=lambda x: (x[0], x[1]), reverse=True)[:global_cap]
+        heapq.heapify(kept)
+        return kept
+
+    @staticmethod
     def _dedup_elite_pool(
         pool: list[tuple[float, int, list[int], int]]
     ) -> list[tuple[float, int, list[int], int]]:
-        """对精英池去重：相同 tokens 只保留得分最高的一条，重建最小堆。"""
-        best: dict[str, tuple[float, int, list[int], int]] = {}
-        for sc, cnt, toks, birth in pool:
-            key = str(toks)
-            if key not in best or sc > best[key][0]:
-                best[key] = (sc, cnt, toks, birth)
-        deduped = list(best.values())
-        heapq.heapify(deduped)
-        return deduped
+        return AlphaEngine._rebalance_elite_pool(pool)
 
     def _update_elite_pool(self, val_score: float, formula: list[int], step: int = 0) -> None:
-        """维护精英公式池（最小堆，Top-ELITE_POOL_SIZE 个历史最优公式，自动去重）。
-
-        去重逻辑：若 formula 已在池中，只在新得分更高时原地更新，不插入重复副本。
-        这防止了单一公式垄断 elite pool，保持多样性。
-        新增：记录 birth_step 用于 elite decay。
-        """
-        k = ModelConfig.ELITE_POOL_SIZE
-
-        # 检查是否已有相同公式
-        for idx, (sc, cnt, toks, birth) in enumerate(self._elite_pool):
-            if toks == formula:
-                if val_score <= sc:
-                    return  # 已有更高分的相同公式，不更新
-                # 分数更高：从堆中移除旧条目，插入新条目
-                self._elite_pool[idx] = self._elite_pool[-1]
-                self._elite_pool.pop()
-                heapq.heapify(self._elite_pool)  # O(k)，k≤20，可接受
-                break
-
-        entry = (val_score, self._elite_counter, list(formula), step)
+        entry = (float(val_score), self._elite_counter, [int(t) for t in formula], int(step))
         self._elite_counter += 1
-        if len(self._elite_pool) < k:
-            heapq.heappush(self._elite_pool, entry)
-        elif val_score > self._elite_pool[0][0]:
-            heapq.heapreplace(self._elite_pool, entry)
+        before = {(sc, tuple(toks), birth) for sc, _cnt, toks, birth in self._elite_pool}
+        rebalanced = self._rebalance_elite_pool(self._elite_pool + [entry])
+        after = {(sc, tuple(toks), birth) for sc, _cnt, toks, birth in rebalanced}
+        if after != before:
+            self._elite_pool = rebalanced
+
+    @classmethod
+    def _rebalance_incubation_pool(
+        cls,
+        pool: list[tuple[float, int, list[int], int]],
+        step: int,
+    ) -> list[tuple[float, int, list[int], int]]:
+        max_age = max(1, int(getattr(ModelConfig, "INCUBATION_CAPTURE_STEPS", 180)))
+        bucket_cap = max(1, int(getattr(ModelConfig, "INCUBATION_BUCKET_CAP", 2)))
+        global_cap = max(1, int(getattr(ModelConfig, "INCUBATION_POOL_SIZE", 36)))
+        min_score = float(getattr(ModelConfig, "INCUBATION_MIN_SCORE", -0.5))
+        fresh = [
+            (float(sc), int(cnt), [int(t) for t in toks], int(birth))
+            for sc, cnt, toks, birth in pool
+            if step - int(birth) <= max_age and float(sc) >= min_score
+        ]
+        by_formula: dict[tuple[int, ...], tuple[float, int, list[int], int]] = {}
+        for entry in fresh:
+            key = tuple(entry[2])
+            if key not in by_formula or entry[0] > by_formula[key][0]:
+                by_formula[key] = entry
+        buckets: dict[tuple, list[tuple[float, int, list[int], int]]] = {}
+        for entry in by_formula.values():
+            buckets.setdefault(cls._elite_bucket_key(entry[2]), []).append(entry)
+        kept: list[tuple[float, int, list[int], int]] = []
+        for entries in buckets.values():
+            kept.extend(sorted(entries, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:bucket_cap])
+        return sorted(kept, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:global_cap]
+
+    def _update_incubation_pool(self, val_score: float, formula: list[int], step: int) -> None:
+        entry = (float(val_score), self._incubation_counter, [int(t) for t in formula], int(step))
+        self._incubation_counter += 1
+        self._incubation_pool = self._rebalance_incubation_pool(
+            self._incubation_pool + [entry], step
+        )
+
+    def _sample_incubation_formulas(self, step: int, k: int) -> tuple[list[list[int]], dict]:
+        self._incubation_pool = self._rebalance_incubation_pool(self._incubation_pool, step)
+        if not self._incubation_pool or k <= 0:
+            return [], {"cells": 0, "scores": [], "max_age": 0}
+        buckets: dict[tuple, list[tuple[float, int, list[int], int]]] = {}
+        ages: list[int] = []
+        for entry in self._incubation_pool:
+            ages.append(max(0, step - entry[3]))
+            buckets.setdefault(self._elite_bucket_key(entry[2]), []).append(entry)
+        keys = list(buckets.keys())
+        formulas: list[list[int]] = []
+        scores: list[float] = []
+        for key in random.choices(keys, k=k):
+            entries = buckets[key]
+            ps = [max(0.01, e[0] - min(0.0, min(x[0] for x in entries)) + 0.01) for e in entries]
+            chosen = random.choices(entries, weights=ps, k=1)[0]
+            formulas.append(list(chosen[2]))
+            scores.append(float(chosen[0]))
+        return formulas, {"cells": len(buckets), "scores": scores, "max_age": max(ages) if ages else 0}
+
+    def _sample_elite_formulas(self, step: int, k: int) -> tuple[list[list[int]], dict]:
+        if not self._elite_pool or k <= 0:
+            return [], {"avg_decay": 0.0, "max_age": 0, "age_list": [], "scores": [], "cells": 0}
+
+        buckets: dict[tuple, list[tuple[float, int, list[int], int, float]]] = {}
+        ages: list[int] = []
+        decays: list[float] = []
+        for sc, cnt, toks, birth in self._elite_pool:
+            age = max(0, step - birth)
+            decay = 1.0
+            if ModelConfig.ELITE_DECAY:
+                half = max(1, ModelConfig.ELITE_DECAY_HALF_LIFE)
+                decay = 0.5 ** (age / half)
+            ages.append(age)
+            decays.append(decay)
+            buckets.setdefault(self._elite_bucket_key(toks), []).append((sc, cnt, toks, birth, decay))
+
+        keys = list(buckets.keys())
+        formulas: list[list[int]] = []
+        scores: list[float] = []
+        for key in random.choices(keys, k=k):
+            entries = buckets[key]
+            ps = [e[0] for e in entries]
+            ps_min = min(ps)
+            ps_max = max(ps)
+            if ps_max > ps_min:
+                normalized = [(s - ps_min) / (ps_max - ps_min + 1e-8) for s in ps]
+            else:
+                normalized = [1.0] * len(ps)
+            temp = 0.7
+            weights = [entries[i][4] * (2.0 ** (normalized[i] / temp)) for i in range(len(entries))]
+            chosen = random.choices(entries, weights=weights, k=1)[0]
+            formulas.append(list(chosen[2]))
+            scores.append(float(chosen[0]))
+
+        return formulas, {
+            "avg_decay": sum(decays) / len(decays) if decays else 0.0,
+            "max_age": max(ages) if ages else 0,
+            "age_list": sorted(ages),
+            "scores": scores,
+            "cells": len(buckets),
+        }
 
     # ── Factor pool ───────────────────────────────────────────────────────────
 
@@ -707,6 +974,52 @@ class AlphaEngine:
         if (corr > ModelConfig.CORR_THRESHOLD).any():
             reward = reward * ModelConfig.CORR_PENALTY
         return reward
+
+    def _apply_corr_penalty_batch(
+        self,
+        rewards: torch.Tensor,
+        factors: torch.Tensor,
+        train_slice: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Batch version of _apply_corr_penalty for factors shaped [B,N,T]."""
+        penalize = self._corr_penalty_mask_batch(factors, train_slice)
+        return torch.where(penalize, rewards * ModelConfig.CORR_PENALTY, rewards)
+
+    def _corr_penalty_mask_batch(
+        self,
+        factors: torch.Tensor,
+        train_slice: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Return which batch rows would be penalized by _apply_corr_penalty."""
+        if not self.factor_pool:
+            return torch.zeros(factors.shape[0], dtype=torch.bool, device=factors.device)
+        if train_slice is not None:
+            s, e = train_slice
+            f = factors.detach()[:, :, s:e]
+        else:
+            f = factors.detach()
+        bsz = f.shape[0]
+        f_flat = f.reshape(bsz, -1).float()
+        f_c = f_flat - f_flat.mean(dim=1, keepdim=True)
+        f_std = f_flat.std(dim=1)
+
+        pool_vecs_list = []
+        for _, _cnt, pf in self.factor_pool:
+            pf_t = pf.detach()
+            if train_slice is not None and pf_t.shape[1] >= factors.shape[2]:
+                pf_t = pf_t[:, s:e]
+            pool_vecs_list.append(pf_t.reshape(-1).float())
+        if not pool_vecs_list:
+            return torch.zeros(factors.shape[0], dtype=torch.bool, device=factors.device)
+
+        pool_vecs = torch.stack(pool_vecs_list, dim=0).to(f_flat.device)
+        p_c = pool_vecs - pool_vecs.mean(dim=1, keepdim=True)
+        cov = torch.matmul(f_c, p_c.transpose(0, 1))
+        sx = f_c.norm(dim=1, keepdim=True) + 1e-8
+        sy = p_c.norm(dim=1).view(1, -1) + 1e-8
+        corr = (cov / (sx * sy)).abs()
+        penalize = (f_std >= 1e-4) & (corr > ModelConfig.CORR_THRESHOLD).any(dim=1)
+        return penalize
 
     def _distribution_stats(self, prev_dist=None):
         """计算模型初始位置（zero prefix）token 分布的细化指标，用于判断 H 不变时
@@ -824,38 +1137,146 @@ class AlphaEngine:
         prev_init_dist     = None  # 用于计算相邻步分布差异 KL
 
         for step in pbar:
+            timing_step0 = time.perf_counter()
+            steps_since_restart = step - self._last_restart_step
+            timing_replay0 = time.perf_counter()
+            n_new, replay_batch = self.replay_policy.plan(
+                step=step,
+                batch_size=bs,
+                last_restart_step=self._last_restart_step,
+            )
+            timing_replay_plan_ms = (time.perf_counter() - timing_replay0) * 1000.0
+            n_incubate = replay_batch.n_incubation
+            n_elite = replay_batch.n_elite
+            elite_frac_eff = replay_batch.elite_frac_effective
+            timing_search0 = time.perf_counter()
+            search_batch = self.search_plugins.plan(
+                step=step,
+                candidate_slots=n_new,
+                best_formula=self.best_formula,
+            )
+            timing_search_plugin_ms = (time.perf_counter() - timing_search0) * 1000.0
+            plugin_formulas = search_batch.formulas
+            plugin_origins = search_batch.origins
+            n_plugin = len(plugin_formulas)
+            n_policy = max(0, n_new - n_plugin)
+            memory_formulas = replay_batch.formulas
+            n_memory = len(memory_formulas)
             # ── Part A: Sample n_new new formulas ────────────────────
-            inp_new = torch.zeros((n_new, 1), dtype=torch.long,
-                                  device=ModelConfig.DEVICE)
+            timing_policy_sample0 = time.perf_counter()
+            timing_ab_forward_ms = 0.0
+            timing_policy_dist_ms = 0.0
+            timing_memory_dist_ms = 0.0
+            inp_new_full = torch.zeros(
+                (n_policy, ModelConfig.MAX_FORMULA_LEN + 1),
+                dtype=torch.long,
+                device=ModelConfig.DEVICE,
+            )
             lp_new, tok_new, ent_new = [], [], []
-            sd_new = [0] * n_new
-            prev_tokens_new: list[int | None] = [None] * n_new
-            infected_chain_new: list[int] = [0] * n_new
+            lp_elite, ent_elite = [], []
+            sd_new = [0] * n_policy
+            prev_tokens_new: list[int | None] = [None] * n_policy
+            infected_chain_new: list[int] = [0] * n_policy
+            inp_e_full = None
+            tok_e_t = None
+            sd_e: list[int] = []
+            prev_tokens_elite: list[int | None] = []
+            infected_chain_elite: list[int] = []
+            if n_memory > 0:
+                inp_e_full = torch.zeros(
+                    (n_memory, ModelConfig.MAX_FORMULA_LEN + 1),
+                    dtype=torch.long,
+                    device=ModelConfig.DEVICE,
+                )
+                tok_e_t = torch.tensor(memory_formulas, dtype=torch.long, device=ModelConfig.DEVICE)
+                sd_e = [0] * n_memory
+                prev_tokens_elite = [None] * n_memory
+                infected_chain_elite = [0] * n_memory
 
-            for si in range(ModelConfig.MAX_FORMULA_LEN):
-                lg, _, _ = self.model(inp_new)
-                lg = self.sampler.apply_mask_to_logits(lg, sd_new, si,
-                                                       ModelConfig.MAX_FORMULA_LEN,
-                                                       prev_tokens=prev_tokens_new,
-                                                       infected_chain_lens=infected_chain_new)
-                d  = Categorical(logits=lg)
-                a  = d.sample()
-                lp_new.append(d.log_prob(a))
-                tok_new.append(a)
-                ent_new.append(d.entropy())
-                inp_new = torch.cat([inp_new, a.unsqueeze(1)], dim=1)
-                for b in range(n_new):
-                    sd_new[b] += self.sampler.delta[a[b].item()]
-                    prev_tokens_new[b] = a[b].item()
-                    infected_chain_new[b] = self.sampler.update_infection(
-                        a[b].item(), infected_chain_new[b])
+            if n_policy > 0 or n_memory > 0:
+                for si in range(ModelConfig.MAX_FORMULA_LEN):
+                    chunks = []
+                    if n_policy > 0:
+                        chunks.append(inp_new_full[:, :si + 1].clone())
+                    if n_memory > 0 and inp_e_full is not None:
+                        chunks.append(inp_e_full[:, :si + 1].clone())
+                    inp_ab = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                    timing_ab_forward0 = time.perf_counter()
+                    lg_ab, _, _ = self.model(inp_ab)
+                    timing_ab_forward_ms += (time.perf_counter() - timing_ab_forward0) * 1000.0
+                    if n_policy > 0:
+                        timing_policy_dist0 = time.perf_counter()
+                        lg_new = self.sampler.apply_mask_to_logits(
+                            lg_ab[:n_policy],
+                            sd_new,
+                            si,
+                            ModelConfig.MAX_FORMULA_LEN,
+                            prev_tokens=prev_tokens_new,
+                            infected_chain_lens=infected_chain_new,
+                        )
+                        d = Categorical(logits=lg_new)
+                        a = d.sample()
+                        lp_new.append(d.log_prob(a))
+                        tok_new.append(a)
+                        ent_new.append(d.entropy())
+                        inp_new_full[:, si + 1] = a
+                        for b in range(n_policy):
+                            tok_id = a[b].item()
+                            sd_new[b] += self.sampler.delta[tok_id]
+                            prev_tokens_new[b] = tok_id
+                            infected_chain_new[b] = self.sampler.update_infection(
+                                tok_id, infected_chain_new[b])
+                        timing_policy_dist_ms += (time.perf_counter() - timing_policy_dist0) * 1000.0
+                    if n_memory > 0 and tok_e_t is not None and inp_e_full is not None:
+                        timing_memory_dist0 = time.perf_counter()
+                        lg_e = self.sampler.apply_mask_to_logits(
+                            lg_ab[n_policy:],
+                            sd_e,
+                            si,
+                            ModelConfig.MAX_FORMULA_LEN,
+                            prev_tokens=prev_tokens_elite,
+                            infected_chain_lens=infected_chain_elite,
+                        )
+                        d_e = Categorical(logits=lg_e)
+                        tk = tok_e_t[:, si]
+                        lp_elite.append(d_e.log_prob(tk))
+                        ent_elite.append(d_e.entropy())
+                        inp_e_full[:, si + 1] = tk
+                        for b in range(n_memory):
+                            tok_id = tk[b].item()
+                            sd_e[b] += self.sampler.delta[tok_id]
+                            prev_tokens_elite[b] = tok_id
+                            infected_chain_elite[b] = self.sampler.update_infection(
+                                tok_id, infected_chain_elite[b])
+                        timing_memory_dist_ms += (time.perf_counter() - timing_memory_dist0) * 1000.0
 
-            seqs_new = torch.stack(tok_new, dim=1)
+            if tok_new:
+                seqs_new_list = torch.stack(tok_new, dim=1).tolist()
+            else:
+                seqs_new_list = []
+            timing_policy_sample_ms = timing_ab_forward_ms + timing_policy_dist_ms
+            timing_memory_logprob_ms = timing_memory_dist_ms
 
 
             # ── Part B: Elite Replay ─────────────────────────────────
-            elite_formulas: list[list[int]] = []
-            if self._elite_pool and n_elite > 0:
+            elite_sample_info = replay_batch.elite_info or {"avg_decay": 0.0, "max_age": 0, "age_list": [], "scores": [], "cells": 0}
+            incubation_sample_info = replay_batch.incubation_info or {"max_age": 0, "scores": [], "cells": 0}
+            if n_elite > 0:
+                if step % 100 == 0:
+                    tqdm.write(
+                        f"[QD优秀池 @ 第{step}步] 类型={elite_sample_info['cells']} "
+                        f"回放={n_elite}/{bs} 有效比例={elite_frac_eff:.3f} "
+                        f"平均衰减={elite_sample_info['avg_decay']:.3f} "
+                        f"最大年龄={elite_sample_info['max_age']} "
+                        f"抽样分数=[{', '.join(f'{s:.3f}' for s in elite_sample_info['scores'][:3])}...]"
+                    )
+            if n_incubate > 0 and step % 50 == 0:
+                tqdm.write(
+                    f"[新方向孵化池 @ 第{step}步] 类型={incubation_sample_info['cells']} "
+                    f"回放={n_incubate}/{bs} 最大年龄={incubation_sample_info['max_age']} "
+                    f"抽样分数=[{', '.join(f'{s:.3f}' for s in incubation_sample_info['scores'][:3])}...]"
+                )
+            if False and self._elite_pool and n_elite > 0:
                 ps = []
                 pt = []
                 weights = []
@@ -896,39 +1317,14 @@ class AlphaEngine:
                         f"抽样分数=[{', '.join(f'{ps[i]:.3f}' for i in idx_e[:3])}...]"
                     )
             else:
-                elite_formulas = seqs_new[:n_elite].tolist()
+                pass
 
-            lp_elite, ent_elite = [], []
-            if elite_formulas:
-                ne     = len(elite_formulas)
-                inp_e  = torch.zeros((ne, 1), dtype=torch.long,
-                                     device=ModelConfig.DEVICE)
-                sd_e   = [0] * ne
-                prev_tokens_elite: list[int | None] = [None] * ne
-                infected_chain_elite: list[int] = [0] * ne
-                tok_e_t = torch.tensor(elite_formulas, dtype=torch.long,
-                                       device=ModelConfig.DEVICE)
-                for si in range(ModelConfig.MAX_FORMULA_LEN):
-                    lg_e, _, _ = self.model(inp_e)
-                    lg_e = self.sampler.apply_mask_to_logits(
-                        lg_e, sd_e, si, ModelConfig.MAX_FORMULA_LEN,
-                        prev_tokens=prev_tokens_elite,
-                        infected_chain_lens=infected_chain_elite
-                    )
-                    d_e  = Categorical(logits=lg_e)
-                    tk   = tok_e_t[:, si]
-                    lp_elite.append(d_e.log_prob(tk))
-                    ent_elite.append(d_e.entropy())
-                    inp_e = torch.cat([inp_e, tk.unsqueeze(1)], dim=1)
-                    for b in range(ne):
-                        sd_e[b] += self.sampler.delta[tk[b].item()]
-                        prev_tokens_elite[b] = tk[b].item()
-                        infected_chain_elite[b] = self.sampler.update_infection(
-                        tk[b].item(), infected_chain_elite[b])
-
+            timing_ab_ms = (time.perf_counter() - timing_step0) * 1000.0
 
             # ── Part C: Evaluate all formulas (并行评估) ────────────────
-            all_fmls = seqs_new.tolist() + elite_formulas
+            timing_eval0 = time.perf_counter()
+            all_fmls = seqs_new_list + plugin_formulas + memory_formulas
+            formula_origins = (["policy"] * len(seqs_new_list)) + plugin_origins + (["memory"] * len(memory_formulas))
             tot      = len(all_fmls)
             rewards    = torch.zeros(tot, device=ModelConfig.DEVICE)
             val_scores = torch.zeros(tot, device=ModelConfig.DEVICE)
@@ -944,7 +1340,7 @@ class AlphaEngine:
             # 并行提交所有公式评估任务
             if ModelConfig.GPU_BATCH_EVAL and use_wf:
                 results = self._eval_formula_batch_tasks(
-                    all_fmls, feat, t_ret, folds, use_wf, factor_pool_snapshot,
+                    step, all_fmls, feat, t_ret, folds, use_wf, factor_pool_snapshot,
                 )
             elif self._eval_pool is not None and self._eval_workers > 1 and tot > 1:
                 from concurrent.futures import ThreadPoolExecutor
@@ -969,6 +1365,7 @@ class AlphaEngine:
                     )
                     for i, fml in enumerate(all_fmls)
                 ]
+            timing_eval_ms = (time.perf_counter() - timing_eval0) * 1000.0
 
             # ── 串行后处理：写入 rewards/val_scores，更新冠军/池 ─────────
             for r in results:
@@ -999,7 +1396,7 @@ class AlphaEngine:
 
                 if final_val > step_max_val:
                     step_max_val = final_val; step_best_f = fml
-                if i < n_new and final_val > new_step_max_val:
+                if i < n_policy + n_plugin and final_val > new_step_max_val:
                     new_step_max_val = final_val; new_step_best_f = fml
 
                 if final_val > self.best_score:
@@ -1035,12 +1432,30 @@ class AlphaEngine:
                                 f"IC={ic_i:.4f} 暴露度={exposure:.1%} | "
                                 f"{fml}\n    {self._decode_formula(fml)}"
                             )
-                self._update_elite_pool(final_val, fml, step)
+                self.replay_policy.observe(
+                    score=final_val,
+                    formula=fml,
+                    step=step,
+                    is_new=i < n_policy + n_plugin,
+                    last_restart_step=self._last_restart_step,
+                )
+
+            plugin_results = [
+                results[i] for i, origin in enumerate(formula_origins)
+                if origin in {"annealing", "genetic"}
+            ]
+            plugin_result_origins = [
+                origin for origin in formula_origins
+                if origin in {"annealing", "genetic"}
+            ]
+            self.search_plugins.observe(step=step, results=plugin_results, origins=plugin_result_origins)
 
 
             # ── Part D: REINFORCE gradient update ────────────────────
             # Fix 3: EMA baseline 替代 batch mean，避免全负 batch 的相对优选问题
             batch_mean = rewards.mean().item()
+            timing_grad0 = time.perf_counter()
+            timing_loss0 = time.perf_counter()
             batch_std  = rewards.std().clamp(min=0.1)
             if ModelConfig.REWARD_EMA_BASELINE and self._reward_ema_step >= ModelConfig.REWARD_EMA_WARMUP:
                 baseline = self._reward_ema
@@ -1053,18 +1468,19 @@ class AlphaEngine:
             else:
                 self._reward_ema = ModelConfig.REWARD_EMA_DECAY * self._reward_ema + (1.0 - ModelConfig.REWARD_EMA_DECAY) * batch_mean
             self._reward_ema_step += 1
-            adv_new   = adv[:n_new]
-            adv_elite = adv[n_new:]
+            adv_new   = adv[:n_policy]
+            adv_elite = adv[n_policy + n_plugin:]
 
             policy_loss = torch.zeros(1, device=ModelConfig.DEVICE)
-            for ti in range(len(lp_new)):
-                policy_loss += (-lp_new[ti] * adv_new).mean()
+            if lp_new:
+                lp_new_t = torch.stack(lp_new, dim=0)
+                policy_loss = policy_loss + (-(lp_new_t * adv_new.unsqueeze(0))).mean(dim=1).sum()
             if lp_elite and adv_elite.shape[0] > 0:
-                for ti in range(len(lp_elite)):
-                    lpe = lp_elite[ti]
-                    if lpe.shape[0] == adv_elite.shape[0]:
-                        policy_loss += (-lpe * adv_elite
-                                        * ModelConfig.ELITE_REWARD_SCALE).mean()
+                lp_elite_t = torch.stack(lp_elite, dim=0)
+                if lp_elite_t.shape[1] == adv_elite.shape[0]:
+                    policy_loss = policy_loss + (
+                        -(lp_elite_t * adv_elite.unsqueeze(0) * ModelConfig.ELITE_REWARD_SCALE)
+                    ).mean(dim=1).sum()
 
             if ent_new:
                 mean_ent_new = torch.stack(ent_new).mean()
@@ -1073,8 +1489,8 @@ class AlphaEngine:
             if ent_elite:
                 mean_ent_elite = torch.stack(ent_elite).mean()
                 mean_ent = (
-                    mean_ent_new * n_new + mean_ent_elite * n_elite
-                ) / (n_new + n_elite)
+                    mean_ent_new * n_policy + mean_ent_elite * n_memory
+                ) / max(1, n_policy + n_memory)
             else:
                 mean_ent = mean_ent_new
             ent_val   = mean_ent.item()
@@ -1089,21 +1505,34 @@ class AlphaEngine:
                     floor_gap, device=ModelConfig.DEVICE, dtype=mean_ent.dtype
                 )
             loss = policy_loss - ent_coeff * mean_ent + ent_floor_loss
+            timing_loss_build_ms = (time.perf_counter() - timing_loss0) * 1000.0
 
-            self.opt.zero_grad()
+            self.opt.zero_grad(set_to_none=True)
+            timing_backward0 = time.perf_counter()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            timing_backward_ms = (time.perf_counter() - timing_backward0) * 1000.0
+            timing_optimizer0 = time.perf_counter()
             self.opt.step()
             if self.use_lord:
                 self.lord_opt.step()
+            timing_optimizer_ms = (time.perf_counter() - timing_optimizer0) * 1000.0
+            timing_grad_ms = (time.perf_counter() - timing_grad0) * 1000.0
 
             # ── Part D2: 分布细化指标 ────────────────────────────────
+            timing_dist0 = time.perf_counter()
             dst = self._distribution_stats(prev_init_dist)
             prev_init_dist = dst['dist']
             with torch.no_grad():
-                uniq_tokens = seqs_new.unique().numel()
-                uniq_fmls   = torch.unique(seqs_new, dim=0).shape[0]
+                if seqs_new_list:
+                    seqs_new_tensor = torch.tensor(seqs_new_list, dtype=torch.long, device=ModelConfig.DEVICE)
+                    uniq_tokens = seqs_new_tensor.unique().numel()
+                    uniq_fmls = torch.unique(seqs_new_tensor, dim=0).shape[0]
+                else:
+                    uniq_tokens = 0
+                    uniq_fmls = 0
                 fml_div     = uniq_fmls / max(1, n_new)
+            timing_dist_stats_ms = (time.perf_counter() - timing_dist0) * 1000.0
 
             # ── Part E: Logging & history & checkpoint ───────────────
             avg_rew = rewards.mean().item()
@@ -1111,16 +1540,33 @@ class AlphaEngine:
             bim  = sum(bic)  / len(bic)  if bic  else 0.0
             bis_ = sum(bis)  / len(bis)  if bis  else 0.0
             bsor_= sum(bsor) / len(bsor) if bsor else 0.0
+            timing_total_ms = (time.perf_counter() - timing_step0) * 1000.0
+            timing_rest_ms = max(
+                0.0,
+                timing_total_ms - timing_ab_ms - timing_eval_ms - timing_grad_ms,
+            )
+            eval_router = self._evaluator_router
+            eval_engine_name = getattr(eval_router, "last_engine", "legacy")
+            guard_report = getattr(eval_router, "last_guard_report", None)
+            guard_passed = getattr(guard_report, "passed", None) if guard_report else None
+            guard_checked = getattr(guard_report, "checked", 0) if guard_report else 0
+            guard_reward_diff = getattr(guard_report, "max_reward_diff", None) if guard_report else None
+            guard_val_diff = getattr(guard_report, "max_val_diff", None) if guard_report else None
+            guard_factor_diff = getattr(guard_report, "max_factor_diff", None) if guard_report else None
 
             self._stagnation_steps = step - self._best_update_step
+            replay_metrics = self.replay_policy.metrics()
+            search_metrics = self.search_plugins.metrics()
             tqdm.write(
                 f"[{step+1}/{end_step}] "
-                f"新公式={n_new} 精英={n_elite} | "
+                f"模型={n_policy} 搜索={n_plugin} 孵化={n_incubate} 精英={n_elite} | "
                 f"有效={ok_cnt} 无效={none_cnt} 常数={const_cnt} | "
                 f"奖励={avg_rew:.3f} 验证={avg_val:.3f} | "
                 f"IC={bim:.4f} | 熵={ent_val:.3f}(系数={ent_coeff:.3f}) | "
                 f"最优={self.best_score:.3f} 停滞={self._stagnation_steps} "
-                f"精英池={len(self._elite_pool)} 重启={self._restart_count}"
+                f"精英池={replay_metrics['elite_pool_size']} "
+                f"孵化池={replay_metrics['incubation_pool_size']} "
+                f"搜索池={search_metrics['search_archive_size']} 重启={self._restart_count}"
             )
             tqdm.write(
                 f"   分布: 初始熵={dst['entropy']:.3f} KL均匀={dst['kl_uniform']:.3f} "
@@ -1130,6 +1576,30 @@ class AlphaEngine:
                 f"本批: 唯一符号={uniq_tokens}/{FORMULA_VOCAB.size} "
                 f"唯一公式={uniq_fmls}/{n_new} 多样性={fml_div:.2f}"
             )
+            tqdm.write(
+                f"[Timing @{step+1}] total={timing_total_ms:.0f}ms | "
+                f"AB(sample+elite)={timing_ab_ms:.0f}ms "
+                f"C(eval)={timing_eval_ms:.0f}ms "
+                f"D(grad)={timing_grad_ms:.0f}ms "
+                f"G(rest)={timing_rest_ms:.0f}ms | "
+                f"mode={'batch' if ModelConfig.GPU_BATCH_EVAL else 'legacy'} "
+                f"device={ModelConfig.DEVICE} "
+                f"engine={eval_engine_name} "
+                f"guard={'pass' if guard_passed else ('fail' if guard_passed is False else 'off')}:{guard_checked}"
+            )
+            if step % 10 == 0:
+                tqdm.write(
+                    f"[TimingDetail @{step+1}] "
+                    f"AB: replay={timing_replay_plan_ms:.0f}ms "
+                    f"search={timing_search_plugin_ms:.0f}ms "
+                    f"forward={timing_ab_forward_ms:.0f}ms "
+                    f"policy={timing_policy_sample_ms:.0f}ms "
+                    f"memory={timing_memory_logprob_ms:.0f}ms | "
+                    f"D: loss={timing_loss_build_ms:.0f}ms "
+                    f"backward={timing_backward_ms:.0f}ms "
+                    f"optim={timing_optimizer_ms:.0f}ms | "
+                    f"dist={timing_dist_stats_ms:.0f}ms"
+                )
             pbar.set_postfix({
                 '验证': f"{avg_val:.3f}", '最优': f"{self.best_score:.3f}",
                 '熵':   f"{ent_val:.2f}", 'IC':   f"{bim:.4f}",
@@ -1157,7 +1627,26 @@ class AlphaEngine:
             self.training_history.setdefault('ic_stability', []).append(bis_)
             self.training_history.setdefault('sortino', []).append(bsor_)
             self.training_history.setdefault('elite_pool_size', []).append(
-                len(self._elite_pool))
+                replay_metrics["elite_pool_size"])
+            self.training_history.setdefault('elite_archive_cells', []).append(
+                replay_metrics["elite_archive_cells"])
+            self.training_history.setdefault('elite_replay_used', []).append(n_elite)
+            self.training_history.setdefault('incubation_replay_used', []).append(n_incubate)
+            self.training_history.setdefault('policy_generated_used', []).append(n_policy)
+            self.training_history.setdefault('search_plugin_used', []).append(n_plugin)
+            self.training_history.setdefault('search_plugin_modules', []).append(
+                ",".join(search_metrics.get("search_plugins") or []))
+            self.training_history.setdefault('search_archive_size', []).append(
+                search_metrics["search_archive_size"])
+            self.training_history.setdefault('search_archive_cells', []).append(
+                search_metrics["search_archive_cells"])
+            self.training_history.setdefault('anneal_accept_rate', []).append(
+                search_metrics["anneal_accept_rate"])
+            self.training_history.setdefault('incubation_pool_size', []).append(
+                replay_metrics["incubation_pool_size"])
+            self.training_history.setdefault('incubation_archive_cells', []).append(
+                replay_metrics["incubation_archive_cells"])
+            self.training_history.setdefault('elite_replay_frac_effective', []).append(elite_frac_eff)
             self.training_history.setdefault('init_entropy', []).append(dst['entropy'])
             self.training_history.setdefault('kl_uniform', []).append(dst['kl_uniform'])
             self.training_history.setdefault('kl_prev', []).append(dst['kl_prev'])
@@ -1166,12 +1655,49 @@ class AlphaEngine:
             self.training_history.setdefault('batch_uniq_tokens', []).append(uniq_tokens)
             self.training_history.setdefault('batch_uniq_fmls', []).append(uniq_fmls)
             self.training_history.setdefault('batch_fml_div', []).append(fml_div)
+            self.training_history.setdefault('timing_total_ms', []).append(timing_total_ms)
+            self.training_history.setdefault('timing_sample_elite_ms', []).append(timing_ab_ms)
+            self.training_history.setdefault('timing_eval_ms', []).append(timing_eval_ms)
+            self.training_history.setdefault('timing_grad_ms', []).append(timing_grad_ms)
+            self.training_history.setdefault('timing_rest_ms', []).append(timing_rest_ms)
+            self.training_history.setdefault('timing_replay_plan_ms', []).append(timing_replay_plan_ms)
+            self.training_history.setdefault('timing_search_plugin_ms', []).append(timing_search_plugin_ms)
+            self.training_history.setdefault('timing_ab_forward_ms', []).append(timing_ab_forward_ms)
+            self.training_history.setdefault('timing_policy_sample_ms', []).append(timing_policy_sample_ms)
+            self.training_history.setdefault('timing_memory_logprob_ms', []).append(timing_memory_logprob_ms)
+            self.training_history.setdefault('timing_loss_build_ms', []).append(timing_loss_build_ms)
+            self.training_history.setdefault('timing_backward_ms', []).append(timing_backward_ms)
+            self.training_history.setdefault('timing_optimizer_ms', []).append(timing_optimizer_ms)
+            self.training_history.setdefault('timing_dist_stats_ms', []).append(timing_dist_stats_ms)
+            self.training_history.setdefault('eval_engine', []).append(eval_engine_name)
+            self.training_history.setdefault('eval_guard_passed', []).append(guard_passed)
+            self.training_history.setdefault('eval_guard_checked', []).append(guard_checked)
+            self.training_history.setdefault('eval_guard_reward_diff', []).append(guard_reward_diff)
+            self.training_history.setdefault('eval_guard_val_diff', []).append(guard_val_diff)
+            self.training_history.setdefault('eval_guard_factor_diff', []).append(guard_factor_diff)
 
             self._save_training_history_live()
 
             if (step + 1) % 20 == 0 or (step + 1) == end_step:
                 ckpt = self.save_checkpoint(step + 1)
                 tqdm.write(f"[检查点] → {ckpt} (最优={self.best_score:.3f})")
+
+            stop_request = read_checkpoint_stop_request(
+                symbol=self.target_symbol,
+                timeframe=getattr(self, "timeframe", None),
+                algorithm_mode="rl",
+            )
+            if stop_request:
+                ckpt = self.save_checkpoint(step + 1)
+                acknowledge_checkpoint_stop(
+                    symbol=self.target_symbol,
+                    timeframe=getattr(self, "timeframe", None),
+                    algorithm_mode="rl",
+                    step=step + 1,
+                    checkpoint_path=ckpt,
+                )
+                tqdm.write(f"[优雅切换] 已保存 checkpoint → {ckpt}; step={step + 1}")
+                return
 
             # ── Part F: Migration hook（多岛训练时交换精英）────────────
             if migration_hook is not None and (step + 1) % ModelConfig.MIGRATION_INTERVAL == 0:
@@ -1198,6 +1724,7 @@ class AlphaEngine:
                 max_r = ModelConfig.MAX_RESTARTS
                 if self._restart_count < max_r:
                     self._restart_count  += 1
+                    self._last_restart_step = step
                     low_entropy_streak    = 0
 
                     # Fix 2: 每 N 次重启做一次完全随机初始化，逃离 best_snapshot 吸引子
@@ -1258,6 +1785,7 @@ class AlphaEngine:
                     # 改为「全参数强扰动 + 重置流计数」继续探索，直到跑满 TRAIN_STEPS。
                     # 从 best_snapshot 恢复（若有）以保住已发现的最优结构，再加大扰动。
                     low_entropy_streak = 0
+                    self._last_restart_step = step
                     hard_noise = min(ModelConfig.NOISE_MAX, noise * 2.0)
                     if self._best_snapshot is not None:
                         self.model.load_state_dict(self._best_snapshot)
@@ -1281,8 +1809,14 @@ class AlphaEngine:
                     "symbol": self.target_symbol,
                     "formula": self.best_formula,
                     "best_score": self.best_score,
+                    "algorithm_mode": str(getattr(self, "algorithm_mode", "rl") or "rl").strip().lower(),
+                    "strategy_source": "champion",
                 }
-                save_path = _strategy_file_for_symbol(self.target_symbol, getattr(self, "timeframe", None))
+                save_path = _strategy_file_for_symbol(
+                    self.target_symbol,
+                    getattr(self, "timeframe", None),
+                    getattr(self, "algorithm_mode", "rl"),
+                )
                 pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
                 # P1-3: 原子写入
                 tmp_path = f"{save_path}.{os.getpid()}.tmp"
@@ -1292,8 +1826,7 @@ class AlphaEngine:
 
             sym_tag = f"[{self.target_symbol}] " if self.target_symbol else ""
             self.training_history.pop('_low_entropy_streak', None)
-            suffix = _artifact_suffix(self.target_symbol, getattr(self, "timeframe", None))
-            hist_path = f"training_history_{suffix}.json" if suffix else "training_history.json"
+            hist_path = self._training_history_path()
             # P1-3: 原子写入
             tmp_hist = hist_path + ".tmp"
             with open(tmp_hist, "w", encoding="utf-8") as fp:
@@ -1322,8 +1855,7 @@ class AlphaEngine:
         if not self.target_symbol:
             return
         try:
-            suffix = _artifact_suffix(self.target_symbol, getattr(self, "timeframe", None))
-            hist_path = f"training_history_{suffix}.json" if suffix else "training_history.json"
+            hist_path = self._training_history_path()
             payload = {
                 k: v for k, v in self.training_history.items()
                 if k != "_low_entropy_streak"
@@ -1340,6 +1872,17 @@ class AlphaEngine:
             except Exception:
                 pass
 
+    def _training_history_path(self) -> str:
+        suffix = _artifact_suffix(self.target_symbol, getattr(self, "timeframe", None))
+        mode = str(getattr(self, "algorithm_mode", "rl") or "rl").strip().lower()
+        if not suffix:
+            return "training_history.json"
+        if mode == "ga":
+            return f"training_history_ga_{suffix}.json"
+        if mode == "hybrid":
+            return f"training_history_hybrid_{suffix}.json"
+        return f"training_history_{suffix}.json"
+
     def _save_strategy_live(self) -> None:
         """每次 best_formula 更新时立即保存 strategy json。
         即使训练中途进程被杀（OOM/终端回收/Ctrl+C），也能保留最新最优公式。
@@ -1351,7 +1894,11 @@ class AlphaEngine:
             return
         try:
             from .vocab import VOCAB_VERSION
-            save_path = _strategy_file_for_symbol(self.target_symbol, getattr(self, "timeframe", None))
+            save_path = _strategy_file_for_symbol(
+                self.target_symbol,
+                getattr(self, "timeframe", None),
+                getattr(self, "algorithm_mode", "rl"),
+            )
             pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
             existing: dict = {}
@@ -1370,6 +1917,8 @@ class AlphaEngine:
                 "formula": self.best_formula,
                 "best_score": self.best_score,
                 "formula_decoded": self._decode_formula(self.best_formula),
+                "algorithm_mode": str(getattr(self, "algorithm_mode", "rl") or "rl").strip().lower(),
+                "strategy_source": "champion",
             }
             # 保留训练数据路径等元数据，避免 live 保存把 data_file 冲掉
             for key in (
@@ -1465,9 +2014,15 @@ class AlphaEngine:
             "best_snapshot":        self._best_snapshot,
             "factor_pool":          self.factor_pool,
             "factor_pool_counter":  self._factor_pool_counter,
-            "elite_pool":           self._elite_pool,
-            "elite_counter":        self._elite_counter,
+            "replay_policy":        self.replay_policy.state_dict(),
+            "search_plugins":       self.search_plugins.state_dict(),
+            # Legacy fields kept for older inspection scripts.
+            "elite_pool":           self.replay_policy.state_dict().get("elite_pool", []),
+            "elite_counter":        self.replay_policy.state_dict().get("elite_counter", 0),
+            "incubation_pool":      self.replay_policy.state_dict().get("incubation_pool", []),
+            "incubation_counter":   self.replay_policy.state_dict().get("incubation_counter", 0),
             "restart_count":        self._restart_count,
+            "last_restart_step":    self._last_restart_step,
             "training_history":     {
                 k: v for k, v in self.training_history.items()
                 if k != '_low_entropy_streak'
@@ -1503,19 +2058,29 @@ class AlphaEngine:
         self._best_snapshot      = ckpt.get("best_snapshot", None)
         self.factor_pool         = ckpt.get("factor_pool", [])
         self._factor_pool_counter = ckpt.get("factor_pool_counter", 0)
-        self._elite_pool         = ckpt.get("elite_pool", [])
-        self._elite_counter      = ckpt.get("elite_counter", 0)
+        replay_state = ckpt.get("replay_policy") or {
+            "elite_pool": ckpt.get("elite_pool", []),
+            "elite_counter": ckpt.get("elite_counter", 0),
+            "incubation_pool": ckpt.get("incubation_pool", []),
+            "incubation_counter": ckpt.get("incubation_counter", 0),
+        }
+        self.replay_policy.load_state_dict(replay_state)
+        self.search_plugins.load_state_dict(ckpt.get("search_plugins") or {})
+        self._elite_pool = replay_state.get("elite_pool", [])
+        self._elite_counter = replay_state.get("elite_counter", 0)
+        self._incubation_pool = replay_state.get("incubation_pool", [])
+        self._incubation_counter = replay_state.get("incubation_counter", 0)
         self._restart_count      = ckpt.get("restart_count", 0)
+        self._last_restart_step  = ckpt.get("last_restart_step", -10**9)
         for k, v in ckpt.get("training_history", {}).items():
             self.training_history[k] = v
 
-        # 清理 elite pool 中的重复条目（保留各公式的最高分版本）
-        self._elite_pool = self._dedup_elite_pool(self._elite_pool)
-
         completed = ckpt.get("step", 0)
+        replay_metrics = self.replay_policy.metrics()
         tqdm.write(f"[检查点] 已从 {path} 恢复。"
                    f" 当前步={completed}  最优={self.best_score:.4f}"
-                   f"  精英池={len(self._elite_pool)}（去重后）")
+                   f"  精英池={replay_metrics['elite_pool_size']} "
+                   f"孵化池={replay_metrics['incubation_pool_size']}")
         return completed
 
     # ── Decode formula tokens to readable string ──────────────────────────────

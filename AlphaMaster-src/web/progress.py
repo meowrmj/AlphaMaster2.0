@@ -15,6 +15,7 @@ from model_core.vocab import FORMULA_VOCAB
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 STRATEGIES_DIR = PROJECT_ROOT / "strategies"
+GA_CHECKPOINT_DIR = CHECKPOINT_DIR / "ga"
 
 
 def _safe_symbol_tag(symbol: str) -> str:
@@ -26,35 +27,109 @@ def _safe_timeframe_tag(timeframe: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", tag)
 
 
-def strategy_path_for(symbol: str, timeframe: str | None = None) -> Path:
+def _artifact_tag(symbol: str, timeframe: str | None = None) -> str:
     tag = _safe_symbol_tag(symbol)
     tf_tag = _safe_timeframe_tag(timeframe)
     if tf_tag:
         tag = f"{tag}_{tf_tag}"
+    return tag
+
+
+def _safe_algorithm_mode(algorithm_mode: str | None = None) -> str:
+    mode = str(algorithm_mode or "rl").strip().lower()
+    return mode if mode in {"rl", "ga", "hybrid"} else "rl"
+
+
+def strategy_path_for(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+    source: str = "champion",
+) -> Path:
+    tag = _artifact_tag(symbol, timeframe)
+    mode = str(algorithm_mode or "").strip().lower()
+    if source == "production":
+        return STRATEGIES_DIR / "production" / f"production_{tag}.json"
+    if mode in {"rl", "ga", "hybrid"}:
+        return STRATEGIES_DIR / "champions" / mode / f"best_{mode}_{tag}.json"
     return STRATEGIES_DIR / f"best_{tag}.json"
 
 
-def checkpoint_glob(symbol: str, timeframe: str | None = None) -> list[Path]:
+def training_history_path_for(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> Path:
     tag = _safe_symbol_tag(symbol)
     tf_tag = _safe_timeframe_tag(timeframe)
     if tf_tag:
+        tag = f"{tag}_{tf_tag}"
+    mode = _safe_algorithm_mode(algorithm_mode)
+    if mode == "ga":
+        return PROJECT_ROOT / f"training_history_ga_{tag}.json"
+    if mode == "hybrid":
+        return PROJECT_ROOT / f"training_history_hybrid_{tag}.json"
+    return PROJECT_ROOT / f"training_history_{tag}.json"
+
+
+def checkpoint_glob(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> list[Path]:
+    tag = _safe_symbol_tag(symbol)
+    tf_tag = _safe_timeframe_tag(timeframe)
+    mode = _safe_algorithm_mode(algorithm_mode)
+    if mode == "ga":
+        base_dir = GA_CHECKPOINT_DIR
+        if tf_tag:
+            patterns = [
+                f"ckpt_ga_{symbol}_{tf_tag}_gen_*.pt",
+                f"ckpt_ga_{tag}_{tf_tag}_gen_*.pt",
+            ]
+        else:
+            patterns = [
+                f"ckpt_ga_{symbol}_gen_*.pt",
+                f"ckpt_ga_{tag}_gen_*.pt",
+            ]
+    elif mode == "hybrid":
+        base_dir = CHECKPOINT_DIR / "hybrid"
+        if tf_tag:
+            patterns = [
+                f"ckpt_hybrid_{symbol}_{tf_tag}_step_*.pt",
+                f"ckpt_hybrid_{tag}_{tf_tag}_step_*.pt",
+            ]
+        else:
+            patterns = [
+                f"ckpt_hybrid_{symbol}_step_*.pt",
+                f"ckpt_hybrid_{tag}_step_*.pt",
+            ]
+    elif tf_tag:
+        base_dir = CHECKPOINT_DIR
         patterns = [
             f"ckpt_{symbol}_{tf_tag}_step_*.pt",
             f"ckpt_{tag}_{tf_tag}_step_*.pt",
         ]
     else:
+        base_dir = CHECKPOINT_DIR
         patterns = [
             f"ckpt_{symbol}_step_*.pt",
             f"ckpt_{tag}_step_*.pt",
         ]
     found: list[Path] = []
     for pattern in patterns:
-        found.extend(CHECKPOINT_DIR.glob(pattern))
-    return sorted(set(found), key=lambda p: p.stat().st_mtime)
+        found.extend(base_dir.glob(pattern))
+    existing: list[tuple[float, Path]] = []
+    for path in set(found):
+        try:
+            existing.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    return [path for _, path in sorted(existing, key=lambda item: item[0])]
 
 
 def _step_from_name(path: Path) -> int:
-    m = re.search(r"_step_(\d+)\.pt$", path.name)
+    m = re.search(r"_(?:step|gen)_(\d+)\.pt$", path.name)
     return int(m.group(1)) if m else 0
 
 
@@ -124,14 +199,26 @@ def _decode_formula(tokens: list[int] | None) -> str | None:
         return str(tokens)
 
 
-def _load_strategy(symbol: str, timeframe: str | None = None) -> dict[str, Any] | None:
-    path = strategy_path_for(symbol, timeframe)
+def _load_strategy(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> dict[str, Any] | None:
+    mode = str(algorithm_mode or "").strip().lower()
+    path = strategy_path_for(symbol, timeframe, mode if mode else None)
+    if not path.exists() and not mode:
+        path = strategy_path_for(symbol, timeframe)
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    mode = _safe_algorithm_mode(algorithm_mode) if algorithm_mode else ""
+    strategy_mode = str(data.get("mode") or "").strip().lower()
+    if mode and strategy_mode.startswith(("rl_", "ga_", "hybrid_")) and not strategy_mode.startswith(f"{mode}_"):
+        return None
+    return data
 
 
 def _infer_timeframe_from_name(name: str) -> str | None:
@@ -178,10 +265,15 @@ def _pick_training_history(
     return file_history if file_n >= ckpt_n else ckpt_history
 
 
-def get_symbol_progress(symbol: str, timeframe: str | None = None) -> SymbolProgress:
+def get_symbol_progress(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> SymbolProgress:
     train_steps = ModelConfig.TRAIN_STEPS
-    strategy = _load_strategy(symbol, timeframe)
-    ckpts = checkpoint_glob(symbol, timeframe)
+    mode = _safe_algorithm_mode(algorithm_mode)
+    strategy = _load_strategy(symbol, timeframe, mode)
+    ckpts = checkpoint_glob(symbol, timeframe, mode)
 
     current_step = 0
     best_score = None
@@ -190,11 +282,7 @@ def get_symbol_progress(symbol: str, timeframe: str | None = None) -> SymbolProg
     ckpt_path: str | None = None
     ckpt_mtime: float | None = None
 
-    hist_tag = _safe_symbol_tag(symbol)
-    tf_tag = _safe_timeframe_tag(timeframe)
-    if tf_tag:
-        hist_tag = f"{hist_tag}_{tf_tag}"
-    hist_file = PROJECT_ROOT / f"training_history_{hist_tag}.json"
+    hist_file = training_history_path_for(symbol, timeframe, mode)
     file_history: dict[str, Any] | None = None
     if hist_file.exists():
         try:
@@ -281,7 +369,16 @@ def list_strategies() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not STRATEGIES_DIR.exists():
         return rows
-    for path in sorted(STRATEGIES_DIR.glob("best_*.json")):
+    patterns = [
+        STRATEGIES_DIR.glob("best_*.json"),
+        (STRATEGIES_DIR / "champions").glob("*/*.json"),
+        (STRATEGIES_DIR / "production").glob("*.json"),
+        (STRATEGIES_DIR / "runs").glob("*/*.json"),
+    ]
+    paths: list[Path] = []
+    for it in patterns:
+        paths.extend(list(it))
+    for path in sorted(set(paths)):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -291,10 +388,36 @@ def list_strategies() -> list[dict[str, Any]]:
         timeframe = data.get("timeframe")
         inferred_timeframe = None if timeframe else _infer_timeframe_from_name(path.name)
         display_timeframe = timeframe or inferred_timeframe
-        expected = strategy_path_for(str(symbol), str(timeframe) if timeframe else None).name
-        is_canonical = path.name == expected
+        mode = str(data.get("algorithm_mode") or data.get("mode") or "").strip().lower()
+        algorithm = data.get("algorithm_mode")
+        if not algorithm:
+            if mode.startswith("ga_"):
+                algorithm = "ga"
+            elif mode.startswith("hybrid_"):
+                algorithm = "hybrid"
+            elif mode.startswith("rl_") or mode == "parquet_file":
+                algorithm = "rl"
+        source = data.get("strategy_source")
+        if not source:
+            if "production" in path.parts:
+                source = "production"
+            elif "runs" in path.parts or path.name.startswith("current_run_best_"):
+                source = "current_run"
+            elif "champions" in path.parts:
+                source = "champion"
+            else:
+                source = "legacy"
+        expected = strategy_path_for(
+            str(symbol),
+            str(timeframe) if timeframe else None,
+            str(algorithm) if algorithm in {"rl", "ga", "hybrid"} and source == "champion" else None,
+            source="production" if source == "production" else "champion",
+        ).resolve()
+        is_canonical = path.resolve() == expected
+        rel = str(path.relative_to(STRATEGIES_DIR)).replace("\\", "/")
         rows.append({
-            "file": path.name,
+            "file": rel,
+            "filename": path.name,
             "symbol": symbol,
             "timeframe": timeframe,
             "display_timeframe": display_timeframe,
@@ -303,6 +426,8 @@ def list_strategies() -> list[dict[str, Any]]:
             "formula_decoded": data.get("formula_decoded") or _decode_formula(formula),
             "train_steps": data.get("train_steps"),
             "mode": data.get("mode"),
+            "algorithm_mode": algorithm,
+            "strategy_source": source,
             "is_canonical": is_canonical,
             "is_legacy": not is_canonical,
         })

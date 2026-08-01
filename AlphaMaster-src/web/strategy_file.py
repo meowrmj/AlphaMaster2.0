@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,46 @@ _STRATEGY_EXPORT_RE = re.compile(
 )
 
 
-def strategy_path_for_symbol(symbol: str, timeframe: str | None = None) -> Path:
-    return strategy_path_for(symbol, timeframe)
+def _atomic_write_json_with_retry(path: Path, payload: dict[str, Any], retries: int = 5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    last_exc: OSError | None = None
+    for attempt in range(retries):
+        tmp_path = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            tmp_path.write_text(text, encoding="utf-8")
+            tmp_path.replace(path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            time.sleep(0.08 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _algorithm_from_mode(mode: str | None) -> str | None:
+    text = str(mode or "").strip().lower()
+    if text.startswith("ga_") or text == "ga":
+        return "ga"
+    if text.startswith("hybrid_") or text == "hybrid":
+        return "hybrid"
+    if text.startswith("rl_") or text in {"rl", "parquet_file"}:
+        return "rl"
+    return None
+
+
+def strategy_path_for_symbol(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str | None = None,
+) -> Path:
+    return strategy_path_for(symbol, timeframe, algorithm_mode)
 
 
 def symbol_from_strategy_path(path: Path) -> str | None:
@@ -212,8 +252,10 @@ def sync_best_strategy_for_symbol(
     *,
     data_file_hint: str | None = None,
     timeframe: str | None = None,
+    algorithm_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """在策略文件与检查点中选出最高分策略，写入 strategies/best_{symbol}.json。"""
+    algorithm = algorithm_mode or "rl"
     candidates: list[tuple[float, list[int], int]] = []
     target_timeframe = timeframe
     if not target_timeframe and data_file_hint:
@@ -222,12 +264,12 @@ def sync_best_strategy_for_symbol(
         except Exception:
             target_timeframe = None
 
-    strat = _load_strategy(symbol, target_timeframe)
+    strat = _load_strategy(symbol, target_timeframe, algorithm)
     if strat and strat.get("formula") and strat.get("best_score") is not None:
         step = int(strat.get("train_step") or strat.get("current_step") or 0)
         candidates.append((float(strat["best_score"]), strat["formula"], step))
 
-    for ckpt_path in checkpoint_glob(symbol, target_timeframe):
+    for ckpt_path in checkpoint_glob(symbol, target_timeframe, algorithm):
         meta = _load_checkpoint_meta(ckpt_path)
         score = meta.get("best_score")
         formula = meta.get("best_formula")
@@ -250,13 +292,13 @@ def sync_best_strategy_for_symbol(
         candidates.append((float(score), formula, _step_from_export_name(path)))
 
     if not candidates:
-        existing = strategy_path_for_symbol(symbol, target_timeframe)
+        existing = strategy_path_for_symbol(symbol, target_timeframe, algorithm)
         if existing.exists():
             return inspect_strategy_file(str(existing.resolve()), data_file_hint=data_file_hint)
         return None
 
     best_score, best_formula, best_step = max(candidates, key=lambda row: (row[0], row[2]))
-    out_path = strategy_path_for_symbol(symbol, target_timeframe)
+    out_path = strategy_path_for_symbol(symbol, target_timeframe, algorithm)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "vocab_version": VOCAB_VERSION,
@@ -265,6 +307,8 @@ def sync_best_strategy_for_symbol(
         "best_score": best_score,
         "formula_decoded": _decode_formula(best_formula),
         "train_step": best_step,
+        "algorithm_mode": algorithm,
+        "strategy_source": "champion",
     }
     if strat:
         for key in ("timeframe", "data_file", "mode", "train_steps"):
@@ -276,7 +320,5 @@ def sync_best_strategy_for_symbol(
     if data_file_hint and not payload.get("data_file"):
         payload = _apply_data_file_fallback(payload, data_file_hint=data_file_hint)
 
-    tmp_path = out_path.with_suffix(out_path.suffix + f".{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp_path.replace(out_path)
+    _atomic_write_json_with_retry(out_path, payload)
     return inspect_strategy_file(str(out_path.resolve()), data_file_hint=data_file_hint)

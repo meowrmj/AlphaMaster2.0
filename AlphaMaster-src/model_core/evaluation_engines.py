@@ -187,6 +187,9 @@ class ScoreGuard:
         max_val = 0.0
         max_oos_sortino = 0.0
         max_factor = 0.0
+        max_reward_idx: int | None = None
+        max_val_idx: int | None = None
+        max_factor_idx: int | None = None
         reason = ""
         ref_by_idx: dict[int, dict[str, Any]] = {}
         fast_by_idx: dict[int, dict[str, Any]] = {}
@@ -198,15 +201,23 @@ class ScoreGuard:
             if ref.get("status") != fast.get("status"):
                 reason = f"status mismatch idx={original_idx}: {ref.get('status')} vs {fast.get('status')}"
                 break
-            max_reward = max(max_reward, _num_diff(ref.get("reward"), fast.get("reward")))
-            max_val = max(max_val, _num_diff(ref.get("val_score"), fast.get("val_score")))
+            reward_diff = _num_diff(ref.get("reward"), fast.get("reward"))
+            val_diff = _num_diff(ref.get("val_score"), fast.get("val_score"))
+            if reward_diff > max_reward:
+                max_reward = reward_diff
+                max_reward_idx = original_idx
+            if val_diff > max_val:
+                max_val = val_diff
+                max_val_idx = original_idx
             if "oos_sortino" in ref or "oos_sortino" in fast:
                 max_oos_sortino = max(max_oos_sortino, _num_diff(ref.get("oos_sortino"), fast.get("oos_sortino")))
             ref_res = ref.get("res")
             fast_res = fast.get("res")
             if torch.is_tensor(ref_res) and torch.is_tensor(fast_res):
                 diff = (ref_res.detach() - fast_res.detach()).abs().max().item()
-                max_factor = max(max_factor, float(diff))
+                if diff > max_factor:
+                    max_factor = float(diff)
+                    max_factor_idx = original_idx
 
         top_reward_stable = True
         top_val_stable = True
@@ -224,9 +235,13 @@ class ScoreGuard:
             and top_val_stable
         )
         if not passed and not reason:
+            culprit_idx = max_reward_idx if max_reward >= max_val else max_val_idx
+            culprit_formula = formulas[culprit_idx] if culprit_idx is not None and 0 <= culprit_idx < len(formulas) else None
             reason = (
                 f"diff too high reward={max_reward:.6g} val={max_val:.6g} "
                 f"oos_sortino={max_oos_sortino:.6g} factor={max_factor:.6g} "
+                f"reward_idx={max_reward_idx} val_idx={max_val_idx} factor_idx={max_factor_idx} "
+                f"culprit_formula={culprit_formula} "
                 f"top_reward_stable={top_reward_stable} top_val_stable={top_val_stable}"
             )
         self.last_report = EvalGuardReport(

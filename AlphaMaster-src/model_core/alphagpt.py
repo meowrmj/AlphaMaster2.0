@@ -190,7 +190,14 @@ class LoopedTransformerLayer(nn.Module):
         for _ in range(self.num_loops):
             # Self-attention with residual
             x_norm = self.norm1(x)
-            attn_out, _ = self.attention(x_norm, x_norm, x_norm, attn_mask=mask, is_causal=is_causal)
+            attn_out, _ = self.attention(
+                x_norm,
+                x_norm,
+                x_norm,
+                attn_mask=mask,
+                is_causal=is_causal,
+                need_weights=False,
+            )
             x = x + self.dropout(attn_out)
 
             # FFN with residual
@@ -259,6 +266,15 @@ class AlphaGPT(nn.Module):
         # 【P2-1 修复】：移除未使用的 head_critic（engine.py 三处调用均丢弃 value）
         # 若未来实现 actor-critic，可重新添加
         # self.head_critic = nn.Linear(self.d_model, 1)
+        self._causal_mask_cache: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (str(device), torch.float32, int(length))
+        mask = self._causal_mask_cache.get(key)
+        if mask is None:
+            mask = nn.Transformer.generate_square_subsequent_mask(length, dtype=torch.float32).to(device)
+            self._causal_mask_cache[key] = mask
+        return mask
 
     def forward(self, idx):
         # idx: [Batch, SeqLen]
@@ -271,7 +287,7 @@ class AlphaGPT(nn.Module):
         x = self.token_emb(idx) + self.pos_emb[:, :T, :]
 
         # Causal Mask
-        mask = nn.Transformer.generate_square_subsequent_mask(T).to(idx.device)
+        mask = self._causal_mask(T, idx.device)
 
         # Process through looped transformer
         x = self.blocks(x, mask=mask, is_causal=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob as _glob
 import json
+import os
 import pathlib
 import re
 import sys
@@ -19,6 +20,7 @@ from data_pipeline.data_manager import MT5DataManager
 from data_pipeline.parquet_manager import ParquetDataManager, inspect_parquet_file
 from model_core.config import ModelConfig
 from model_core.engine import AlphaEngine
+from model_core.ga_engine import GeneticAlphaEngine
 from model_core.vocab import VOCAB_VERSION
 
 DEFAULT_TRAIN_RATIO = 0.80
@@ -33,16 +35,40 @@ def _artifact_suffix(symbol: str, timeframe: str | None = None) -> str:
     return f"{_safe_artifact_tag(symbol)}_{tf}" if tf else _safe_artifact_tag(symbol)
 
 
-def _strategy_path(symbol: str, timeframe: str | None = None) -> pathlib.Path:
-    return pathlib.Path("strategies") / f"best_{_artifact_suffix(symbol, timeframe)}.json"
+def _strategy_path(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str = "rl",
+) -> pathlib.Path:
+    mode = algorithm_mode if algorithm_mode in {"rl", "ga", "hybrid"} else "rl"
+    return pathlib.Path("strategies") / "champions" / mode / f"best_{mode}_{_artifact_suffix(symbol, timeframe)}.json"
 
 
-def _checkpoint_pattern(symbol: str, timeframe: str | None = None) -> str:
-    return str(pathlib.Path("checkpoints") / f"ckpt_{_artifact_suffix(symbol, timeframe)}_step_*.pt")
+def _algorithm_mode() -> str:
+    mode = os.getenv("ALPHAMASTER_ALGORITHM_MODE", ModelConfig.ALGORITHM_MODE).strip().lower()
+    return mode if mode in {"rl", "ga", "hybrid"} else "rl"
 
 
-def _history_path(symbol: str, timeframe: str | None = None) -> pathlib.Path:
-    return pathlib.Path(f"training_history_{_artifact_suffix(symbol, timeframe)}.json")
+def _checkpoint_pattern(symbol: str, timeframe: str | None = None, algorithm_mode: str = "rl") -> str:
+    suffix = _artifact_suffix(symbol, timeframe)
+    if algorithm_mode == "ga":
+        return str(pathlib.Path("checkpoints") / "ga" / f"ckpt_ga_{suffix}_gen_*.pt")
+    if algorithm_mode == "hybrid":
+        return str(pathlib.Path("checkpoints") / "hybrid" / f"ckpt_hybrid_{suffix}_step_*.pt")
+    return str(pathlib.Path("checkpoints") / f"ckpt_{suffix}_step_*.pt")
+
+
+def _history_path(
+    symbol: str,
+    timeframe: str | None = None,
+    algorithm_mode: str = "rl",
+) -> pathlib.Path:
+    suffix = _artifact_suffix(symbol, timeframe)
+    if algorithm_mode == "ga":
+        return pathlib.Path(f"training_history_ga_{suffix}.json")
+    if algorithm_mode == "hybrid":
+        return pathlib.Path(f"training_history_hybrid_{suffix}.json")
+    return pathlib.Path(f"training_history_{suffix}.json")
 
 
 def _same_scope(data: dict, symbol: str, timeframe: str) -> bool:
@@ -85,6 +111,10 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
     info = inspect_parquet_file(data_file)
     symbol = info["symbol"]
     timeframe = info["timeframe"]
+    algorithm_mode = _algorithm_mode()
+    if algorithm_mode == "hybrid":
+        print("[algorithm] Hybrid 框架已预留，但当前版本尚未实现训练逻辑。请先选择 RL 或 GA。")
+        return None
 
     print(f"\n{'=' * 60}")
     print(f"  AlphaMaster file training - {info['filename']}")
@@ -94,7 +124,9 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
     print(f"  Train steps: {ModelConfig.TRAIN_STEPS}")
     print(f"  Bars: {info['bars']}")
     print(f"  Mode: {'from_scratch' if from_scratch else 'resume'}")
+    print(f"  Algorithm: {algorithm_mode.upper()}")
     print(f"  Eval device: {ModelConfig.DEVICE}  batch_eval={ModelConfig.GPU_BATCH_EVAL}")
+    print(f"  Search plugins: {os.getenv('ALPHAMASTER_SEARCH_CONFIG', '{}')}")
     print(f"{'=' * 60}")
 
     try:
@@ -110,10 +142,12 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
         print(f"  [error] data loading failed: {e}")
         return None
 
-    engine = AlphaEngine(data_manager=mgr, target_symbol=symbol)
+    engine_cls = GeneticAlphaEngine if algorithm_mode == "ga" else AlphaEngine
+    engine = engine_cls(data_manager=mgr, target_symbol=symbol)
     engine.timeframe = timeframe
     engine.data_file = str(Path(data_file).resolve())
-    engine.mode = "parquet_file"
+    engine.mode = f"{algorithm_mode}_parquet_file"
+    engine.algorithm_mode = algorithm_mode
     engine.train_steps = ModelConfig.TRAIN_STEPS
     engine.train_sample = "train_only"
     engine.train_ratio = DEFAULT_TRAIN_RATIO
@@ -121,7 +155,7 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
     engine.train_end_bar = train_end
     engine.oos_start_bar = train_end
 
-    ckpt_files = sorted(_glob.glob(_checkpoint_pattern(symbol, timeframe)))
+    ckpt_files = sorted(_glob.glob(_checkpoint_pattern(symbol, timeframe, algorithm_mode)))
     start_step = 0
 
     if from_scratch:
@@ -132,14 +166,14 @@ def train_from_file(data_file: str, *, from_scratch: bool = False) -> AlphaEngin
                 removed += 1
             except OSError as e:
                 print(f"  [warn] could not remove checkpoint {p}: {e}")
-        hist_path = _history_path(symbol, timeframe)
+        hist_path = _history_path(symbol, timeframe, algorithm_mode)
         if hist_path.exists():
             try:
                 hist_path.unlink()
             except OSError:
                 pass
         print(f"  [retrain] removed {removed} checkpoints; starting at step 0")
-        print("  [retrain] saved champion is kept on disk only; this run best starts from scratch")
+        print(f"  [retrain] removed {algorithm_mode.upper()} checkpoints only; saved champion is kept on disk")
         ckpt_files = []
     elif ckpt_files:
         latest = ckpt_files[-1]
@@ -176,7 +210,7 @@ def _seed_best_from_strategy(
     total_bars: int,
     train_end: int,
 ) -> None:
-    path = _strategy_path(symbol, timeframe)
+    path = _strategy_path(symbol, timeframe, getattr(engine, "algorithm_mode", "rl"))
     if not path.exists():
         return
     try:
@@ -204,8 +238,9 @@ def _seed_best_from_strategy(
 
 
 def _save_strategy(engine: AlphaEngine, symbol: str, timeframe: str, data_file: str, total_bars: int, train_end: int) -> None:
-    path = _strategy_path(symbol, timeframe)
-    path.parent.mkdir(exist_ok=True)
+    algorithm_mode = getattr(engine, "algorithm_mode", "rl")
+    path = _strategy_path(symbol, timeframe, algorithm_mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if engine.best_formula is None:
         if path.exists():
             try:
@@ -239,6 +274,8 @@ def _save_strategy(engine: AlphaEngine, symbol: str, timeframe: str, data_file: 
         "formula": engine.best_formula,
         "formula_decoded": engine._decode_formula(engine.best_formula) if engine.best_formula else None,
         "best_score": engine.best_score,
+        "algorithm_mode": algorithm_mode,
+        "strategy_source": "champion",
     }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"  Strategy saved: {path}")

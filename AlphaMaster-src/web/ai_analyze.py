@@ -19,22 +19,31 @@ _SYSTEM_PROMPT = """你是量化因子挖掘与强化学习训练顾问。用户
 回答要求：
 - 用中文，尽量说人话，少用术语。
 - 不要编造快照里没有的数据。
-- 评估是否值得继续训练时，以 val_score 走势、本轮最优分是否停滞、entropy 是否还活跃为主。
+- 结论必须先分清“训练流程是否正常”和“策略质量是否值得信任”，不要混成一句话。
+- 评估是否值得继续训练时，必须同时看 val_score、best_score、batch_best_val_score、new_candidate_best_val_score、entropy、elite_replay_used、timing_*。不要只看单个指标。
+- val_score 是当前批次/训练步的平均验证表现，不等于冠军策略分数；它可以为负，但同一批里仍可能出现高分候选。
+- best_score 是本轮运行最大值/冠军线，天然会长时间横盘；横盘不等于程序卡死。判断是否停滞，要结合 new_candidate_best_val_score 是否还在接近或冲击 best_score。
+- batch_best_val_score 是本批最高分，可能包含精英回放；new_candidate_best_val_score 是本步不含精英回放的新候选最高分，更适合判断模型是否真的在发现新东西。
+- entropy 上升通常表示重新探索/分布变松，不要简单说成“瞎探索”；entropy 很低且多样性下降才更像坍缩。
+- elite_replay_used 表示本步注入了多少条优秀旧公式。当前系统使用 QD 优秀池 + 冷却恢复机制：重启后先降低精英回放，再逐步恢复，目的是减少旧冠军把模型拉回同一方向。
+- incubation_pool / incubation_replay_used 是“新方向孵化池”：重启后的新候选如果结构有差异，即使暂时弱于历史冠军，也会被短期保护和少量回放，用来验证新方向是否能成长。
 - 不要因为保存冠军分高、本轮候选分低，就直接说训练坏了；重新训练时本轮分数低于历史保存冠军是正常的。
+- timing_total_ms / timing_eval_ms / timing_sample_elite_ms / timing_grad_ms 用来判断性能瓶颈；如果存在这些字段，说明训练正在记录拆分耗时。
 - “saved_champion” 是当前保存下来的冠军策略，可能来自更早训练。
 - “current_run_best” 是本轮训练最新 checkpoint 里的本轮最优策略。
 - 第二部分必须分别解释 saved_champion 和 current_run_best 的公式含义；如果两者相同，要明确说它们一致。
+- 公式是栈式 VM 公式，不一定能按“第一步输入第二步”机械解释成线性因果链；解释时可以说大体看哪些量价/波动/方向信息，但不要武断断言一定做多或做空，最终方向要以信号输出和回测为准。
 
 必须使用这两个小标题：
 
 ## 1. 当前训练情况怎么样？是否值得继续
-说明进度、验证分数走势、本轮最优分是否停滞，并给出继续训练或先回测的建议。
+说明进度、训练是否活着、当前模式、平均验证分、本批最高分、新候选最高分、本轮最优分、熵、精英回放和耗时瓶颈。先判断流程是否正常，再判断策略质量是否可靠，并给出继续训练、观察到某个步数、或先回测的建议。
 
 ## 2. 因子的含义与原理
 分别解释：
 - 保存冠军公式 saved_champion
 - 本轮最优公式 current_run_best
-解释每条公式大概在看什么，组合起来可能怎样判断做多/做空。
+解释每条公式大概用了哪些信息，以及可能反映的市场状态。必须提醒：这是栈式公式的近似解释，交易方向和有效性要以回测结果为准。
 """
 
 
@@ -194,6 +203,8 @@ def analyze_training_stream(
         "1. 当前训练情况怎么样？是否值得继续？",
         "2. 请分别解释 saved_champion（保存冠军公式）和 current_run_best（本轮最优公式）的含义与原理；如果两者相同，请说明它们目前一致。",
         "",
+        "请特别注意：val_score 是当前步/当前批的平均验证分，不是冠军分；best_score 是本轮运行最大值，横盘不等于卡死；new_candidate_best_val_score 才更能说明模型是否在发现新的高分候选；batch_best_val_score 可能含精英回放；elite_replay_used 要结合 QD 优秀池的冷却/恢复机制理解。",
+        "",
         "【当前训练快照】",
         f"```json\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n```",
     ]
@@ -327,7 +338,25 @@ def _training_curve(history: dict[str, Any], max_points: int = 500) -> dict[str,
         return {"total_points": 0, "sampled": False, "points": 0, "series": {}}
 
     total = len(steps)
-    keys = ("step", "best_score", "val_score", "entropy", "avg_reward", "stable_rank")
+    keys = (
+        "step",
+        "best_score",
+        "val_score",
+        "batch_best_val_score",
+        "new_candidate_best_val_score",
+        "entropy",
+        "avg_reward",
+        "stable_rank",
+        "elite_replay_used",
+        "incubation_replay_used",
+        "incubation_pool_size",
+        "incubation_archive_cells",
+        "timing_total_ms",
+        "timing_sample_elite_ms",
+        "timing_eval_ms",
+        "timing_grad_ms",
+        "timing_rest_ms",
+    )
     available = [key for key in keys if isinstance(history.get(key), list) and history.get(key)]
 
     if total <= max_points:
@@ -366,7 +395,17 @@ def _history_summary(history: dict[str, Any]) -> dict[str, Any]:
         return {}
     best = history.get("best_score") or []
     val = history.get("val_score") or []
+    batch_best = history.get("batch_best_val_score") or []
+    new_candidate_best = history.get("new_candidate_best_val_score") or []
     entropy = history.get("entropy") or []
+    elite_replay = history.get("elite_replay_used") or []
+    incubation_replay = history.get("incubation_replay_used") or []
+    incubation_pool = history.get("incubation_pool_size") or []
+    incubation_cells = history.get("incubation_archive_cells") or []
+    timing_total = history.get("timing_total_ms") or []
+    timing_eval = history.get("timing_eval_ms") or []
+    timing_sample_elite = history.get("timing_sample_elite_ms") or []
+    timing_grad = history.get("timing_grad_ms") or []
     steps = history.get("step") or []
     summary: dict[str, Any] = {"points": len(steps)}
     if steps:
@@ -408,4 +447,59 @@ def _history_summary(history: dict[str, Any]) -> dict[str, Any]:
     if entropy:
         summary["entropy_first"] = entropy[0]
         summary["entropy_last"] = entropy[-1]
+        if len(entropy) >= 20:
+            tail = entropy[-20:]
+            summary["entropy_tail20_mean"] = sum(tail) / len(tail)
+            summary["entropy_tail20_trend"] = tail[-1] - tail[0]
+    if batch_best:
+        summary["batch_best_val_score_last"] = batch_best[-1]
+        summary["batch_best_val_score_max"] = max(batch_best)
+        tail = batch_best[-50:]
+        if tail:
+            summary["batch_best_val_score_tail50_max"] = max(tail)
+            summary["batch_best_val_score_tail50_mean"] = sum(tail) / len(tail)
+    if new_candidate_best:
+        summary["new_candidate_best_val_score_last"] = new_candidate_best[-1]
+        summary["new_candidate_best_val_score_max"] = max(new_candidate_best)
+        tail = new_candidate_best[-50:]
+        if tail:
+            summary["new_candidate_best_val_score_tail50_max"] = max(tail)
+            summary["new_candidate_best_val_score_tail50_mean"] = sum(tail) / len(tail)
+            if best:
+                summary["new_candidate_tail50_gap_to_best"] = max(best) - max(tail)
+    if elite_replay:
+        summary["elite_replay_used_last"] = elite_replay[-1]
+        tail = elite_replay[-50:]
+        if tail:
+            summary["elite_replay_used_tail50_min"] = min(tail)
+            summary["elite_replay_used_tail50_max"] = max(tail)
+            summary["elite_replay_used_tail50_mean"] = sum(tail) / len(tail)
+    if incubation_replay:
+        summary["incubation_replay_used_last"] = incubation_replay[-1]
+        tail = incubation_replay[-50:]
+        if tail:
+            summary["incubation_replay_used_tail50_max"] = max(tail)
+            summary["incubation_replay_used_tail50_mean"] = sum(tail) / len(tail)
+    if incubation_pool:
+        summary["incubation_pool_size_last"] = incubation_pool[-1]
+        summary["incubation_pool_size_max"] = max(incubation_pool)
+    if incubation_cells:
+        summary["incubation_archive_cells_last"] = incubation_cells[-1]
+        summary["incubation_archive_cells_max"] = max(incubation_cells)
+    if timing_total:
+        tail = timing_total[-50:]
+        summary["timing_total_ms_last"] = timing_total[-1]
+        summary["timing_total_ms_tail50_mean"] = sum(tail) / len(tail)
+    if timing_eval:
+        tail = timing_eval[-50:]
+        summary["timing_eval_ms_last"] = timing_eval[-1]
+        summary["timing_eval_ms_tail50_mean"] = sum(tail) / len(tail)
+    if timing_sample_elite:
+        tail = timing_sample_elite[-50:]
+        summary["timing_sample_elite_ms_last"] = timing_sample_elite[-1]
+        summary["timing_sample_elite_ms_tail50_mean"] = sum(tail) / len(tail)
+    if timing_grad:
+        tail = timing_grad[-50:]
+        summary["timing_grad_ms_last"] = timing_grad[-1]
+        summary["timing_grad_ms_tail50_mean"] = sum(tail) / len(tail)
     return summary

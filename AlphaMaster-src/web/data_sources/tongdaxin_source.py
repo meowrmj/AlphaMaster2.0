@@ -138,15 +138,51 @@ class TongdaxinSource(DataSource):
                 pass
         self._api = None
 
-    def _fetch_raw(self, cat: int, market: int, code: str, want: int, is_index: bool):
+    def _fetch_raw(
+        self, cat: int, market: int, code: str, start: int, want: int, is_index: bool
+    ):
         """指数走 get_index_bars，股票走 get_security_bars。
 
         通达信协议规定指数必须用 get_index_bars；若对指数用 get_security_bars，
         返回数据从第 2 条起 datetime 会损坏（年份变成 7772、228200 等乱码）。
         """
         if is_index:
-            return self._api.get_index_bars(cat, market, code, 0, want)
-        return self._api.get_security_bars(cat, market, code, 0, want)
+            return self._api.get_index_bars(cat, market, code, start, want)
+        return self._api.get_security_bars(cat, market, code, start, want)
+
+    def _fetch_raw_pages(
+        self, cat: int, market: int, code: str, want: int, is_index: bool
+    ):
+        page_size = 800
+        target = max(want, 20)
+        raw_all = []
+        seen = set()
+        start = 0
+        while len(raw_all) < target:
+            batch = self._fetch_raw(
+                cat, market, code, start, min(page_size, target - len(raw_all)), is_index
+            )
+            if not batch:
+                break
+            added = 0
+            for row in batch:
+                key = (
+                    str(row.get("datetime", "")),
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("vol"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_all.append(row)
+                added += 1
+            if len(batch) < page_size or added == 0:
+                break
+            start += len(batch)
+        return raw_all
 
     def fetch_bars(
         self, symbol: str, timeframe: str, n: int, drop_forming: bool = True
@@ -160,18 +196,18 @@ class TongdaxinSource(DataSource):
             raise DataSourceUnavailable(f"通达信不支持周期 {timeframe}")
         market, code = _parse_market(symbol)
         cat = _CAT[timeframe]
-        want = min(max(n + 2, 20), 800)  # 单次上限 800
+        want = max(n + 2, 20)
         is_index = _is_index(market, code)
 
         with self._lock:
             self.connect()
             try:
-                raw = self._fetch_raw(cat, market, code, want, is_index)
+                raw = self._fetch_raw_pages(cat, market, code, want, is_index)
             except Exception:
                 # 连接可能失效，重连一次
                 self._api = None
                 self.connect()
-                raw = self._fetch_raw(cat, market, code, want, is_index)
+                raw = self._fetch_raw_pages(cat, market, code, want, is_index)
 
         if not raw:
             raise DataSourceUnavailable(

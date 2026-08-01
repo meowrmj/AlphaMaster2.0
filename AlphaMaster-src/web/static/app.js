@@ -6,11 +6,21 @@ let selectedStrategyFile = null;
 let selectedStrategySymbol = null;
 let selectedBacktestDataFile = null;
 let evalMode = localStorage.getItem("alphamaster_eval_mode") || "cpu_batch";
+let algorithmMode = localStorage.getItem("alphamaster_algorithm_mode") || "rl";
+let replayPolicy = localStorage.getItem("alphamaster_replay_policy") || "qd_incubation";
+let replayConfig = null;
+let searchConfig = null;
+let replayPolicyPage = 0;
 let chart = null;
 let chartSymbol = null;
 let chartZoom = { min: null, max: null };
 let chartDrag = null;
+let chartAutoFollow = true;
 let chartZoomHandlersReady = false;
+let trainingStartPending = false;
+let trainingPendingAction = null;
+let trainingRequestInFlight = false;
+let trainingModeApplyInFlight = false;
 let pollTimer = null;
 let clientErrors = [];
 let debugMode = false;
@@ -23,11 +33,44 @@ let btBuster = "";      // 图表缓存刷新键（用 job 时间戳）
 let btPortfolioSig = ""; // 绩效卡签名：变化时才重建 + 播放数字动画，避免每次轮询重播
 let lastEquityData = null; // 最近一次资金曲线数据，供绩效卡 sparkline 复用
 let lastTrainingActive = false;
+let lastTrainingStatus = null;
 let btLastAlertKey = "";
 let lastErrorPopupText = "";
 let lastErrorPopupAt = 0;
 
 const $ = (id) => document.getElementById(id);
+const DEFAULT_CHART_WINDOW = 360;
+const MIN_LAUNCH_PENDING_MS = 650;
+const START_BTN_IDLE_TEXT = "开始训练";
+const RETRAIN_BTN_TEXT = "重新训练";
+const STOP_BTN_TEXT = "停止";
+
+const EVAL_MODE_LABELS = {
+  cpu_batch: "CPU batch",
+  cuda_batch: "CUDA batch",
+  legacy_cpu: "旧 CPU",
+};
+
+const REPLAY_POLICY_LABELS = {
+  qd_incubation: "QD + 新方向孵化",
+  qd: "QD 优秀池",
+  incubation: "新方向孵化",
+  none: "关闭回放",
+};
+
+const REPLAY_MODULES = [
+  { key: "qd", label: "QD 优秀池" },
+  { key: "incubation", label: "新方向孵化" },
+];
+
+const REPLAY_PAGE_LABELS = ["回放记忆", "搜索增强"];
+const SEARCH_MODULES = [
+  { key: "annealing", label: "退火" },
+  { key: "genetic", label: "遗传" },
+];
+
+replayConfig = loadReplayConfig();
+searchConfig = loadSearchConfig();
 
 function getEvalMode() {
   const select = $("evalModeSelect");
@@ -36,16 +79,259 @@ function getEvalMode() {
   return value;
 }
 
-function initEvalModeSelect() {
+function getAlgorithmMode() {
+  const select = $("algorithmModeSelect");
+  const value = select?.value || algorithmMode || "rl";
+  if (!["rl", "ga", "hybrid"].includes(value)) return "rl";
+  return value;
+}
+
+function algorithmQueryParam() {
+  return `algorithm_mode=${encodeURIComponent(getAlgorithmMode())}`;
+}
+
+function algorithmModeLabel(mode) {
+  return { rl: "强化学习 RL", ga: "独立遗传算法 GA", hybrid: "混合搜索 Hybrid" }[mode] || "强化学习 RL";
+}
+
+function syncEvalOptionsForAlgorithm() {
   const select = $("evalModeSelect");
   if (!select) return;
-  select.value = ["cpu_batch", "cuda_batch", "legacy_cpu"].includes(evalMode) ? evalMode : "cpu_batch";
-  evalMode = select.value;
-  localStorage.setItem("alphamaster_eval_mode", evalMode);
-  select.addEventListener("change", () => {
+  const legacy = Array.from(select.options).find((option) => option.value === "legacy_cpu");
+  const isGa = getAlgorithmMode() === "ga";
+  if (legacy) legacy.disabled = isGa;
+  if (isGa && select.value === "legacy_cpu") {
+    select.value = "cpu_batch";
+    evalMode = "cpu_batch";
+    localStorage.setItem("alphamaster_eval_mode", evalMode);
+  }
+}
+
+function scopedReplayConfigForAlgorithm() {
+  if (getAlgorithmMode() === "ga") {
+    return normalizeReplayConfig({ modules: { qd: false, incubation: false } });
+  }
+  return getReplayConfig();
+}
+
+function scopedSearchConfigForAlgorithm() {
+  if (getAlgorithmMode() === "ga") {
+    return normalizeSearchConfig({ modules: { annealing: false, genetic: false } });
+  }
+  return getSearchConfig();
+}
+
+function syncAlgorithmScopedControls() {
+  syncEvalOptionsForAlgorithm();
+  const mode = getAlgorithmMode();
+  const isGa = mode === "ga";
+  const replayPanel = $("replayPolicyPanel");
+  const label = $("evalModeLabelText");
+  if (replayPanel) {
+    replayPanel.classList.toggle("hidden", isGa);
+    if (isGa) replayPanel.open = false;
+  }
+  if (label) label.textContent = isGa ? "GA 评估模式" : "评估加速模式";
+  updateReplayPolicySummary();
+}
+
+function evalModeLabel(mode) {
+  return EVAL_MODE_LABELS[mode] || EVAL_MODE_LABELS.cpu_batch;
+}
+
+function replayModulesFromLegacy(policy) {
+  const value = String(policy || "qd_incubation").toLowerCase();
+  return {
+    qd: value === "qd_incubation" || value === "qd",
+    incubation: value === "qd_incubation" || value === "incubation",
+  };
+}
+
+function replayPolicyFromModules(modules) {
+  const qd = Boolean(modules?.qd);
+  const incubation = Boolean(modules?.incubation);
+  if (qd && incubation) return "qd_incubation";
+  if (qd) return "qd";
+  if (incubation) return "incubation";
+  return "none";
+}
+
+function normalizeReplayConfig(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const rawModules = value.modules && typeof value.modules === "object"
+      ? value.modules
+      : replayModulesFromLegacy(value.name || value.policy || replayPolicy);
+    const modules = {};
+    for (const mod of REPLAY_MODULES) modules[mod.key] = Boolean(rawModules[mod.key]);
+    return { version: 1, modules };
+  }
+  return { version: 1, modules: replayModulesFromLegacy(value || replayPolicy) };
+}
+
+function loadReplayConfig() {
+  const raw = localStorage.getItem("alphamaster_replay_config");
+  if (raw) {
+    try {
+      return normalizeReplayConfig(JSON.parse(raw));
+    } catch (_) {
+      // Fall back to the legacy string below.
+    }
+  }
+  return normalizeReplayConfig(localStorage.getItem("alphamaster_replay_policy") || "qd_incubation");
+}
+
+function saveReplayConfig(config) {
+  replayConfig = normalizeReplayConfig(config);
+  replayPolicy = replayPolicyFromModules(replayConfig.modules);
+  localStorage.setItem("alphamaster_replay_config", JSON.stringify(replayConfig));
+  localStorage.setItem("alphamaster_replay_policy", replayPolicy);
+  updateReplayPolicySummary();
+}
+
+function normalizeSearchConfig(value) {
+  const modules = {};
+  const rawModules = value && typeof value === "object" && !Array.isArray(value) && value.modules
+    ? value.modules
+    : {};
+  for (const mod of SEARCH_MODULES) modules[mod.key] = Boolean(rawModules[mod.key]);
+  return { version: 1, modules };
+}
+
+function loadSearchConfig() {
+  const raw = localStorage.getItem("alphamaster_search_config");
+  if (raw) {
+    try {
+      return normalizeSearchConfig(JSON.parse(raw));
+    } catch (_) {
+      // Fall back to disabled modules.
+    }
+  }
+  return normalizeSearchConfig(null);
+}
+
+function saveSearchConfig(config) {
+  searchConfig = normalizeSearchConfig(config);
+  localStorage.setItem("alphamaster_search_config", JSON.stringify(searchConfig));
+  updateReplayPolicySummary();
+}
+
+function getSearchConfig() {
+  const modules = {};
+  for (const mod of SEARCH_MODULES) {
+    const input = document.querySelector(`[data-search-module="${mod.key}"]`);
+    modules[mod.key] = input ? Boolean(input.checked) : Boolean(searchConfig.modules?.[mod.key]);
+  }
+  return normalizeSearchConfig({ modules });
+}
+
+function searchPluginSummary(config = searchConfig) {
+  const normalized = normalizeSearchConfig(config);
+  const enabled = SEARCH_MODULES.filter((mod) => normalized.modules[mod.key]).map((mod) => mod.label);
+  return enabled.length ? enabled.join(" + ") : "无搜索增强";
+}
+
+function getReplayConfig() {
+  const modules = {};
+  for (const mod of REPLAY_MODULES) {
+    const input = document.querySelector(`[data-replay-module="${mod.key}"]`);
+    modules[mod.key] = input ? Boolean(input.checked) : Boolean(replayConfig.modules?.[mod.key]);
+  }
+  return normalizeReplayConfig({ modules });
+}
+
+function getReplayPolicy() {
+  return replayPolicyFromModules(getReplayConfig().modules);
+}
+
+function replayPolicyLabel(policy) {
+  return REPLAY_POLICY_LABELS[policy] || REPLAY_POLICY_LABELS.qd_incubation;
+}
+
+function replayPolicyLabelFromConfig(config) {
+  return replayPolicyLabel(replayPolicyFromModules(normalizeReplayConfig(config).modules));
+}
+
+function updateReplayPolicySummary() {
+  const summary = $("replayPolicySummary");
+  if (getAlgorithmMode() === "ga") {
+    if (summary) summary.textContent = "GA 独立种群，不使用 RL 回放";
+    return;
+  }
+  if (summary) summary.textContent = `${replayPolicyLabel(replayPolicy)} / ${searchPluginSummary()}`;
+}
+
+function renderReplayPolicyPage() {
+  const pages = Array.from(document.querySelectorAll(".replay-policy-page"));
+  if (!pages.length) return;
+  replayPolicyPage = Math.max(0, Math.min(replayPolicyPage, pages.length - 1));
+  pages.forEach((page, index) => page.classList.toggle("active", index === replayPolicyPage));
+  const label = $("replayPolicyPageLabel");
+  if (label) label.textContent = `${REPLAY_PAGE_LABELS[replayPolicyPage] || "搜索增强"} ${replayPolicyPage + 1}/${pages.length}`;
+  const prev = $("replayPolicyPrevBtn");
+  const next = $("replayPolicyNextBtn");
+  if (prev) prev.disabled = replayPolicyPage <= 0;
+  if (next) next.disabled = replayPolicyPage >= pages.length - 1;
+}
+
+function initEvalModeSelect() {
+  const algorithmSelect = $("algorithmModeSelect");
+  const select = $("evalModeSelect");
+  const replayInputs = Array.from(document.querySelectorAll("[data-replay-module]"));
+  const searchInputs = Array.from(document.querySelectorAll("[data-search-module]"));
+  if (algorithmSelect) {
+    algorithmSelect.value = ["rl", "ga", "hybrid"].includes(algorithmMode) ? algorithmMode : "rl";
+    algorithmMode = getAlgorithmMode();
+    localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+    algorithmSelect.addEventListener("change", () => {
+      algorithmMode = getAlgorithmMode();
+      localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+      syncAlgorithmScopedControls();
+      handleAlgorithmModeSelectionChange();
+    });
+  }
+  if (select) {
+    select.value = ["cpu_batch", "cuda_batch", "legacy_cpu"].includes(evalMode) ? evalMode : "cpu_batch";
+    syncAlgorithmScopedControls();
     evalMode = getEvalMode();
     localStorage.setItem("alphamaster_eval_mode", evalMode);
-  });
+    select.addEventListener("change", () => {
+      evalMode = getEvalMode();
+      localStorage.setItem("alphamaster_eval_mode", evalMode);
+      handleTrainingModeSelectionChange({ userInitiated: true });
+    });
+  }
+  if (replayInputs.length) {
+    replayConfig = normalizeReplayConfig(replayConfig);
+    for (const input of replayInputs) {
+      input.checked = Boolean(replayConfig.modules?.[input.dataset.replayModule]);
+    }
+    saveReplayConfig(getReplayConfig());
+    const onReplayPolicyChange = () => {
+      saveReplayConfig(getReplayConfig());
+      handleTrainingModeSelectionChange({ userInitiated: true });
+    };
+    replayInputs.forEach((input) => input.addEventListener("change", onReplayPolicyChange));
+    searchConfig = normalizeSearchConfig(searchConfig);
+    for (const input of searchInputs) {
+      input.checked = Boolean(searchConfig.modules?.[input.dataset.searchModule]);
+    }
+    saveSearchConfig(getSearchConfig());
+    const onSearchConfigChange = () => {
+      saveSearchConfig(getSearchConfig());
+      handleTrainingModeSelectionChange({ userInitiated: true });
+    };
+    searchInputs.forEach((input) => input.addEventListener("change", onSearchConfigChange));
+    $("replayPolicyPrevBtn")?.addEventListener("click", () => {
+            replayPolicyPage -= 1;
+            renderReplayPolicyPage();
+    });
+    $("replayPolicyNextBtn")?.addEventListener("click", () => {
+      replayPolicyPage += 1;
+      renderReplayPolicyPage();
+    });
+    renderReplayPolicyPage();
+  }
+  syncAlgorithmScopedControls();
 }
 
 const CPU_TRAINING_NOTE = `暂无报错
@@ -253,6 +539,59 @@ function formatScore(v) {
   return Number(v).toFixed(4);
 }
 
+function waitForNextPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+
+async function waitForLaunchPendingMinimum(startedAt) {
+  const elapsed = Date.now() - startedAt;
+  const remaining = MIN_LAUNCH_PENDING_MS - elapsed;
+  if (remaining > 0) {
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+}
+
+function setTrainingActionPending(action) {
+  const pending = Boolean(action);
+  const startedAt = Date.now();
+  trainingStartPending = Boolean(pending);
+  trainingPendingAction = action || null;
+  const launchPending = action === "start" || action === "retrain";
+  const startBtn = $("startBtn");
+  const retrainBtn = $("retrainBtn");
+  const stopBtn = $("stopBtn");
+  const pill = $("jobPill");
+  if (startBtn) {
+    startBtn.disabled = pending || !selectedDataFile;
+    startBtn.textContent = launchPending ? "等待中" : START_BTN_IDLE_TEXT;
+    startBtn.classList.toggle("is-pending", launchPending);
+  }
+  if (retrainBtn) {
+    retrainBtn.disabled = !selectedDataFile;
+    retrainBtn.textContent = RETRAIN_BTN_TEXT;
+    retrainBtn.classList.remove("is-pending");
+  }
+  if (stopBtn) {
+    stopBtn.disabled = action === "stop" || !(lastTrainingStatus?.active);
+    stopBtn.textContent = action === "stop" ? "停止中" : STOP_BTN_TEXT;
+    stopBtn.classList.toggle("is-pending", action === "stop");
+  }
+  if (pill && pending) {
+    const pendingText = action === "stop" ? "停止中" : "等待中";
+    pill.innerHTML = `<i class="pill-dot"></i>${pendingText}`;
+    pill.className = "pill running";
+  }
+  const hint = $("logHint");
+  if (hint && pending) {
+    hint.textContent = action === "stop"
+        ? "正在停止训练进程..."
+        : "正在提交训练启动请求...";
+  }
+  return startedAt;
+}
+
 function renderDataFileCard(info) {
   const card = $("dataFileCard");
   const startBtn = $("startBtn");
@@ -303,8 +642,10 @@ function renderDataFileCard(info) {
     </div>
     <div class="path" title="${info.data_file}">${info.filename || info.data_file}</div>
   `;
-  startBtn.disabled = false;
-  if ($("retrainBtn")) $("retrainBtn").disabled = false;
+  if (!trainingStartPending) {
+    startBtn.disabled = false;
+    if ($("retrainBtn")) $("retrainBtn").disabled = false;
+  }
 }
 
 function updateBtStartBtn() {
@@ -450,6 +791,33 @@ function makeGradient(ctx, area, rgb, alpha = 0.16) {
   return g;
 }
 
+function finiteSeries(history, key) {
+  const values = history?.[key];
+  if (!Array.isArray(values)) return [];
+  return values.map((v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  });
+}
+
+function hasFiniteSeries(history, key) {
+  return finiteSeries(history, key).some((v) => v !== null);
+}
+
+function sameFiniteSeries(a, b) {
+  const x = Array.isArray(a) ? a : [];
+  const y = Array.isArray(b) ? b : [];
+  if (!x.length || x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i += 1) {
+    const xv = Number(x[i]);
+    const yv = Number(y[i]);
+    if (!Number.isFinite(xv) && !Number.isFinite(yv)) continue;
+    if (!Number.isFinite(xv) || !Number.isFinite(yv)) return false;
+    if (Math.abs(xv - yv) > 1e-10) return false;
+  }
+  return true;
+}
+
 // 发光效果：在每条数据线绘制前设置对应颜色的柔和阴影
 const glowPlugin = {
   id: "neonGlow",
@@ -519,13 +887,19 @@ const CHART_OPTIONS = {
 };
 
 function buildChartDatasets(history) {
-  return CHART_SERIES.filter((s) => history?.[s.key]?.length).map((s) => {
+  const hiddenDuplicateKeys = new Set();
+  if (sameFiniteSeries(history?.new_candidate_best_val_score, history?.batch_best_val_score)) {
+    hiddenDuplicateKeys.add("new_candidate_best_val_score");
+  }
+  return CHART_SERIES
+    .filter((s) => !hiddenDuplicateKeys.has(s.key) && hasFiniteSeries(history, s.key))
+    .map((s) => {
     const isBatchBest = s.key === "batch_best_val_score";
     const isNewBest = s.key === "new_candidate_best_val_score";
     const fillAlpha = isBatchBest ? 0.06 : isNewBest ? 0.08 : 0.16;
     return {
       label: s.label,
-      data: history[s.key],
+      data: finiteSeries(history, s.key),
       borderColor: s.borderColor,
       borderWidth: 2,
       tension: 0.35,
@@ -553,6 +927,7 @@ function destroyChart() {
   }
   chartSymbol = null;
   chartZoom = { min: null, max: null };
+  chartAutoFollow = true;
 }
 
 function createChart(ctx, steps, history) {
@@ -561,6 +936,46 @@ function createChart(ctx, steps, history) {
     data: { labels: steps, datasets: buildChartDatasets(history) },
     options: CHART_OPTIONS,
   });
+}
+
+function latestHistoryValue(history, key) {
+  const arr = history?.[key];
+  if (!Array.isArray(arr) || !arr.length) return null;
+  for (let i = arr.length - 1; i >= 0; i -= 1) {
+    const value = Number(arr[i]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function formatTimingMs(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)}s`;
+  return `${Math.round(value)}ms`;
+}
+
+function renderTimingSummary(history) {
+  const box = $("timingSummary");
+  if (!box) return;
+  const total = latestHistoryValue(history, "timing_total_ms");
+  const values = {
+    timingTotal: total,
+    timingAB: latestHistoryValue(history, "timing_sample_elite_ms"),
+    timingEval: latestHistoryValue(history, "timing_eval_ms"),
+    timingGrad: latestHistoryValue(history, "timing_grad_ms"),
+    timingRest: latestHistoryValue(history, "timing_rest_ms"),
+  };
+  box.hidden = !Number.isFinite(total);
+  let visibleItems = 0;
+  for (const [id, value] of Object.entries(values)) {
+    const el = $(id);
+    if (!el) continue;
+    const visible = Number.isFinite(value);
+    if (el.parentElement) el.parentElement.hidden = !visible;
+    if (visible) visibleItems += 1;
+    el.textContent = formatTimingMs(value);
+  }
+  box.hidden = visibleItems === 0;
 }
 
 function clampChartWindow(min, max, total) {
@@ -594,6 +1009,41 @@ function applyChartZoom(mode = "none") {
 
 function resetChartZoom() {
   chartZoom = { min: null, max: null };
+  chartAutoFollow = false;
+  applyChartZoom("active");
+}
+
+function currentChartWindowSpan(total) {
+  if (!Number.isFinite(total) || total <= 1) return DEFAULT_CHART_WINDOW - 1;
+  const min = chartZoom.min ?? Math.max(0, total - DEFAULT_CHART_WINDOW);
+  const max = chartZoom.max ?? total - 1;
+  const span = max - min;
+  return Number.isFinite(span) && span > 0 ? span : Math.min(DEFAULT_CHART_WINDOW - 1, total - 1);
+}
+
+function chartWindowTouchesLatest(total, tolerance = 2) {
+  if (!Number.isFinite(total) || total <= 0) return true;
+  if (chartZoom.min == null || chartZoom.max == null) return true;
+  return chartZoom.max >= total - 1 - tolerance;
+}
+
+function followLatestChartWindow(total, spanOverride = null) {
+  if (!Number.isFinite(total) || total <= DEFAULT_CHART_WINDOW) {
+    chartZoom = { min: null, max: null };
+    return;
+  }
+  const span = Number.isFinite(spanOverride)
+    ? Math.max(2, Math.min(spanOverride, total - 1))
+    : currentChartWindowSpan(total);
+  chartZoom = {
+    min: Math.max(0, total - 1 - span),
+    max: total - 1,
+  };
+}
+
+function resetChartToLatest() {
+  chartAutoFollow = true;
+  followLatestChartWindow(chart?.data?.labels?.length || 0);
   applyChartZoom("active");
 }
 
@@ -609,7 +1059,14 @@ function zoomChartAt(canvasX, factor) {
   const ratio = (canvasX - area.left) / Math.max(1, area.right - area.left);
   const center = currentMin + span * ratio;
   const nextSpan = span * factor;
+  const wasFollowingLatest = chartAutoFollow || chartWindowTouchesLatest(total);
   chartZoom = clampChartWindow(center - nextSpan * ratio, center + nextSpan * (1 - ratio), total);
+  if (wasFollowingLatest && chartWindowTouchesLatest(total)) {
+    chartAutoFollow = true;
+    followLatestChartWindow(total, currentChartWindowSpan(total));
+  } else {
+    chartAutoFollow = false;
+  }
   applyChartZoom("none");
 }
 
@@ -622,6 +1079,7 @@ function panChartByPixels(deltaX) {
   const pointsPerPixel = span / Math.max(1, area.right - area.left);
   const shift = -deltaX * pointsPerPixel;
   chartZoom = clampChartWindow(chartDrag.min + shift, chartDrag.max + shift, total);
+  chartAutoFollow = chartWindowTouchesLatest(total);
   applyChartZoom("none");
 }
 
@@ -656,7 +1114,7 @@ function installChartZoomHandlers() {
   };
   canvas.addEventListener("pointerup", endDrag);
   canvas.addEventListener("pointercancel", endDrag);
-  canvas.addEventListener("dblclick", resetChartZoom);
+  canvas.addEventListener("dblclick", resetChartToLatest);
 }
 
 function updateChartInPlace(steps, history) {
@@ -677,7 +1135,8 @@ function updateChartInPlace(steps, history) {
   chart.data.datasets = chart.data.datasets.filter((d) => nextLabels.has(d.label));
 
   const grew = steps.length > prevLen;
-  chart.update(grew ? "active" : "none");
+  if (chartAutoFollow && grew) followLatestChartWindow(steps.length, currentChartWindowSpan(prevLen || steps.length));
+  applyChartZoom(grew ? "active" : "none");
 }
 
 function renderChart(history, label, progress) {
@@ -686,6 +1145,7 @@ function renderChart(history, label, progress) {
   const steps = history?.step || [];
   if (!steps.length) {
     destroyChart();
+    renderTimingSummary(null);
     if (progress?.current_step > 0) {
       $("chartHint").textContent = `训练中 第 ${progress.current_step}/${progress.train_steps} 步，曲线每步更新`;
     } else {
@@ -697,24 +1157,35 @@ function renderChart(history, label, progress) {
   const sameSymbol = chart && chartSymbol === label;
   if (sameSymbol) {
     updateChartInPlace(steps, history);
+    renderTimingSummary(history);
   } else {
     destroyChart();
-    chartZoom = { min: null, max: null };
+    chartAutoFollow = true;
+    followLatestChartWindow(steps.length);
     chart = createChart(ctx, steps, history);
     chartSymbol = label;
+    applyChartZoom("none");
+    renderTimingSummary(history);
   }
 
   $("chartTitle").textContent = `${label} 训练曲线`;
-  $("chartHint").textContent = `${steps.length} 个记录点 · 滚轮缩放，拖动平移，双击重置`;
+  const windowText = chartZoom.min == null
+    ? `${steps.length} 个记录点`
+    : `${steps.length} 个记录点 · 显示 ${chartZoom.min + 1}-${chartZoom.max + 1}`;
+  const followText = chartAutoFollow ? "跟随最新" : "查看历史";
+  $("chartHint").textContent = `${windowText} · ${followText} · 滚轮缩放，拖动平移，双击回到最新`;
 }
 
 async function loadSymbolChart(symbol, progress) {
   if (!symbol) return;
   try {
     const timeframe = progress?.timeframe || null;
-    const qs = timeframe ? `?timeframe=${encodeURIComponent(timeframe)}` : "";
+    const qs = timeframe
+      ? `?timeframe=${encodeURIComponent(timeframe)}&${algorithmQueryParam()}`
+      : `?${algorithmQueryParam()}`;
     const data = await fetchJSON(`/api/symbols/${encodeURIComponent(symbol)}${qs}`);
-    const label = data.timeframe ? `${symbol} ${data.timeframe}` : symbol;
+    const labelBase = data.timeframe ? `${symbol} ${data.timeframe}` : symbol;
+    const label = `${labelBase} ${algorithmModeLabel(data.algorithm_mode || getAlgorithmMode())}`;
     renderChart(data.history, label, progress || data);
     $("formulaText").textContent = data.formula_decoded || "—";
   } catch (e) {
@@ -742,18 +1213,40 @@ function renderStrategies(rows) {
 }
 
 function updateTrainingUI(training, progress) {
+  lastTrainingStatus = training;
   const job = training?.job;
   const active = training?.active;
+  if (active) {
+    syncRunningTrainingControls(job);
+  } else {
+    syncAlgorithmScopedControls();
+  }
+  updateEvalModeApplyState(training);
   const pill = $("jobPill");
   const startBtn = $("startBtn");
   const retrainBtn = $("retrainBtn");
   const stopBtn = $("stopBtn");
 
+  if (trainingStartPending && !trainingRequestInFlight) {
+    setTrainingActionPending(null);
+  }
+
+  if (trainingStartPending) {
+    updateTrainingTimeFields(progress, training);
+    return;
+  }
+
   if (!job || job.state === "idle") {
     pill.innerHTML = '<i class="pill-dot"></i>空闲';
     pill.className = "pill";
+    startBtn.textContent = START_BTN_IDLE_TEXT;
     startBtn.disabled = !selectedDataFile;
-    if (retrainBtn) retrainBtn.disabled = !selectedDataFile;
+    startBtn.classList.remove("is-pending");
+    if (retrainBtn) {
+      retrainBtn.textContent = RETRAIN_BTN_TEXT;
+      retrainBtn.disabled = !selectedDataFile;
+      retrainBtn.classList.remove("is-pending");
+    }
     stopBtn.disabled = true;
     $("logHint").textContent = "—";
     updateTrainingTimeFields(progress, training);
@@ -771,9 +1264,17 @@ function updateTrainingUI(training, progress) {
   pill.innerHTML = `<i class="pill-dot"></i>${stateText} · ${label}`;
   pill.className = "pill " + (job.state === "running" ? "running" : job.state);
 
+  startBtn.textContent = active ? "训练中" : START_BTN_IDLE_TEXT;
   startBtn.disabled = active;
-  if (retrainBtn) retrainBtn.disabled = active;
+  startBtn.classList.remove("is-pending");
+  if (retrainBtn) {
+    retrainBtn.textContent = RETRAIN_BTN_TEXT;
+    retrainBtn.disabled = !selectedDataFile;
+    retrainBtn.classList.remove("is-pending");
+  }
   stopBtn.disabled = !active;
+  stopBtn.textContent = STOP_BTN_TEXT;
+  stopBtn.classList.remove("is-pending");
   $("logHint").textContent = job.log_path || "—";
   updateTrainingTimeFields(progress, training);
 
@@ -789,7 +1290,7 @@ async function refreshOverview() {
   let training = { active: false, job: null, log_tail: [] };
 
   try {
-    overview = await fetchJSON("/api/overview", { silent: true });
+    overview = await fetchJSON(`/api/overview?${algorithmQueryParam()}`, { silent: true });
   } catch (_) {}
 
   try {
@@ -1185,18 +1686,56 @@ async function browseDataFile() {
   }
 }
 
-async function startTraining() {
-  if (!selectedDataFile) {
-    await logClientError("请先选择数据文件");
+async function applyEvalModeToCurrentTraining() {
+  const mode = getEvalMode();
+  const algorithm = getAlgorithmMode();
+  const replayPayload = scopedReplayConfigForAlgorithm();
+  const searchPayload = scopedSearchConfigForAlgorithm();
+  const replay = replayPolicyFromModules(replayPayload.modules);
+  const job = lastTrainingStatus?.job;
+  const current = job?.eval_mode;
+  const currentReplay = job?.replay_config
+    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
+    : (job?.replay_policy || "qd_incubation");
+  if (!lastTrainingStatus?.active) {
+    if (!job?.data_file) {
+      updateEvalModeApplyState(lastTrainingStatus);
+      return;
+    }
+    try {
+      const res = await fetchJSON("/api/training/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data_file: job.data_file, from_scratch: false, algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
+      });
+      selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
+      renderDataFileCard(res.data_file);
+      await refreshOverview();
+    } catch (e) {
+      $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
     return;
   }
+  if ((job?.algorithm_mode || "rl") !== algorithm) {
+    await stopTraining();
+    return;
+  }
+  if (current === mode && currentReplay === replay && (job?.algorithm_mode || "rl") === algorithm) {
+    updateEvalModeApplyState(lastTrainingStatus);
+    return;
+  }
+  const ok = window.confirm(
+    `要把当前训练从 ${algorithmModeLabel(job?.algorithm_mode || "rl")} / ${evalModeLabel(current)} / ${replayPolicyLabel(currentReplay)} / ${searchPluginSummary(job?.search_config)} 切到 ${algorithmModeLabel(algorithm)} / ${evalModeLabel(mode)} / ${replayPolicyLabel(replayPolicyFromModules(replayPayload.modules))} / ${searchPluginSummary(searchPayload)} 吗？\n\n` +
+      "程序会先停止当前训练进程，再用同一个数据文件从检查点继续训练。"
+  );
+  if (!ok) return;
   try {
-    const res = await fetchJSON("/api/training/start", {
+    const res = await fetchJSON("/api/training/apply-eval-mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: false, eval_mode: getEvalMode() }),
+      body: JSON.stringify({ algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
     });
-    selectedSymbol = res.data_file?.symbol || res.job?.symbol;
+    selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
     renderDataFileCard(res.data_file);
     await refreshOverview();
   } catch (e) {
@@ -1204,28 +1743,293 @@ async function startTraining() {
   }
 }
 
-async function retrainFromScratch() {
+async function handleAlgorithmModeSelectionChange() {
+  updateEvalModeApplyState(lastTrainingStatus);
+  const job = lastTrainingStatus?.job;
+  const activeAlgorithm = job?.algorithm_mode || "rl";
+  if (lastTrainingStatus?.active && job && activeAlgorithm !== getAlgorithmMode()) {
+    await stopTraining();
+    return;
+  }
+  await refreshOverview();
+}
+
+function updateEvalModeApplyState(training) {
+  const hint = $("evalModeHint");
+  if (!hint) return;
+  const selectedMode = getEvalMode();
+  const selectedAlgorithm = getAlgorithmMode();
+  const selectedReplayConfig = scopedReplayConfigForAlgorithm();
+  const selectedSearchConfig = scopedSearchConfigForAlgorithm();
+  const selectedReplay = replayPolicyFromModules(selectedReplayConfig.modules);
+  const selectedSearch = searchPluginSummary(selectedSearchConfig);
+  const job = training?.job || null;
+  const active = Boolean(training?.active && job);
+  const activeAlgorithm = job?.algorithm_mode || "rl";
+  const activeMode = job?.eval_mode || "cpu_batch";
+  const activeReplay = job?.replay_config
+    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
+    : (job?.replay_policy || "qd_incubation");
+  const activeSearch = searchPluginSummary(job?.search_config);
+  const changed = active && (
+    selectedAlgorithm !== activeAlgorithm ||
+    selectedMode !== activeMode ||
+    selectedReplay !== activeReplay ||
+    JSON.stringify(selectedSearchConfig.modules) !== JSON.stringify(normalizeSearchConfig(job?.search_config).modules)
+  );
+  const resumable = Boolean(!active && job?.data_file);
+
+  if (trainingModeApplyInFlight) {
+    hint.textContent = `正在应用：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。会先保存当前节点，再按新设置续跑。`;
+    return;
+  }
+
+  if (active) {
+    if (selectedAlgorithm !== activeAlgorithm) {
+      hint.textContent = `当前正在运行：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)}。你正在查看：${algorithmModeLabel(selectedAlgorithm)}。切换算法会先停止当前训练，不会自动启动新算法；停稳后手动点击“开始训练”继续所选算法。`;
+      return;
+    }
+    hint.textContent = changed
+      ? `当前训练：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。同一算法内切换会自动保存当前节点，再按新设置续跑。`
+      : `当前训练已使用：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}。`;
+    return;
+  }
+
+  if (job?.data_file) {
+    hint.textContent = `当前没有运行训练；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。下次点“开始训练”才会按这个设置续跑。`;
+    return;
+  }
+
+  hint.textContent = selectedAlgorithm === "ga"
+    ? `当前未运行；下次启动：独立遗传算法 GA / ${evalModeLabel(selectedMode)}。GA 使用独立种群和独立历史，不使用 RL 的精英回放插件。`
+    : `当前未运行；下次启动：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。`;
+  return;
+
+  if (trainingModeApplyInFlight) {
+    hint.textContent = `正在应用：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。会先保存当前节点，再按新设置续跑。`;
+    return;
+  }
+
+  if (active) {
+    hint.textContent = changed
+      ? `当前训练：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。切换后会自动保存当前节点，再按新设置续跑。`
+      : `当前训练已使用：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}。`;
+    return;
+  }
+
+  if (job?.data_file) {
+    hint.textContent = `当前没有运行训练；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。下次点“开始训练”才会按这个设置续跑。`;
+    return;
+  }
+
+  hint.textContent = selectedAlgorithm === "ga"
+    ? `当前未运行；下次启动：独立遗传算法 GA / ${evalModeLabel(selectedMode)}。GA 使用独立种群和独立历史，不使用 RL 的精英回放插件。`
+    : `当前未运行；下次启动：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。`;
+}
+
+function restoreControlsFromTrainingJob(job) {
+  if (!job) return;
+  const alg = job.algorithm_mode || "rl";
+  const mode = job.eval_mode || "cpu_batch";
+  const replay = normalizeReplayConfig(job.replay_config || { modules: { qd: true, incubation: true } });
+  const search = normalizeSearchConfig(job.search_config || { modules: { annealing: false, genetic: false } });
+  const algSelect = $("algorithmModeSelect");
+  const evalSelect = $("evalModeSelect");
+  if (algSelect) algSelect.value = alg;
+  if (evalSelect) evalSelect.value = mode;
+  algorithmMode = getAlgorithmMode();
+  evalMode = getEvalMode();
+  localStorage.setItem("alphamaster_algorithm_mode", algorithmMode);
+  localStorage.setItem("alphamaster_eval_mode", evalMode);
+  saveReplayConfig(replay);
+  saveSearchConfig(search);
+  for (const input of Array.from(document.querySelectorAll("[data-replay-module]"))) {
+    input.checked = Boolean(replay.modules?.[input.dataset.replayModule]);
+  }
+  for (const input of Array.from(document.querySelectorAll("[data-search-module]"))) {
+    input.checked = Boolean(search.modules?.[input.dataset.searchModule]);
+  }
+  syncAlgorithmScopedControls();
+  updateEvalModeApplyState(lastTrainingStatus);
+}
+
+function syncRunningTrainingControls(job) {
+  if (!job || trainingModeApplyInFlight || trainingStartPending) return;
+  const alg = job.algorithm_mode || "rl";
+  const mode = job.eval_mode || "cpu_batch";
+  const algSelect = $("algorithmModeSelect");
+  const evalSelect = $("evalModeSelect");
+  if (algSelect && algSelect.value !== alg) {
+    updateEvalModeApplyState(lastTrainingStatus);
+    return;
+  }
+  if (evalSelect && evalSelect.value !== mode) {
+    evalSelect.value = mode;
+    evalMode = getEvalMode();
+    localStorage.setItem("alphamaster_eval_mode", evalMode);
+  }
+  const replay = normalizeReplayConfig(job.replay_config || job.replay_policy || { modules: { qd: true, incubation: true } });
+  const search = normalizeSearchConfig(job.search_config || { modules: { annealing: false, genetic: false } });
+  replayConfig = replay;
+  replayPolicy = replayPolicyFromModules(replay.modules);
+  searchConfig = search;
+  localStorage.setItem("alphamaster_replay_config", JSON.stringify(replayConfig));
+  localStorage.setItem("alphamaster_replay_policy", replayPolicy);
+  localStorage.setItem("alphamaster_search_config", JSON.stringify(searchConfig));
+  for (const input of Array.from(document.querySelectorAll("[data-replay-module]"))) {
+    input.checked = Boolean(replay.modules?.[input.dataset.replayModule]);
+  }
+  for (const input of Array.from(document.querySelectorAll("[data-search-module]"))) {
+    input.checked = Boolean(search.modules?.[input.dataset.searchModule]);
+  }
+  syncAlgorithmScopedControls();
+}
+
+async function handleTrainingModeSelectionChange(options = {}) {
+  updateEvalModeApplyState(lastTrainingStatus);
+  if (!lastTrainingStatus?.active) {
+    await refreshOverview();
+    return;
+  }
+  if (!options.userInitiated || trainingStartPending || trainingModeApplyInFlight) return;
+  if ((lastTrainingStatus?.job?.algorithm_mode || "rl") !== getAlgorithmMode()) return;
+  await applySelectedModeToActiveTraining();
+}
+
+async function applySelectedModeToActiveTraining() {
+  if (trainingModeApplyInFlight) return;
+  const mode = getEvalMode();
+  const algorithm = getAlgorithmMode();
+  const replayPayload = scopedReplayConfigForAlgorithm();
+  const searchPayload = scopedSearchConfigForAlgorithm();
+  const job = lastTrainingStatus?.job;
+  if (!lastTrainingStatus?.active || !job) return;
+  if ((job?.algorithm_mode || "rl") !== algorithm) {
+    updateEvalModeApplyState(lastTrainingStatus);
+    return;
+  }
+
+  const currentReplay = job?.replay_config
+    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
+    : (job?.replay_policy || "qd_incubation");
+  const currentSearch = JSON.stringify(normalizeSearchConfig(job?.search_config).modules);
+  const nextReplay = replayPolicyFromModules(replayPayload.modules);
+  const nextSearch = JSON.stringify(searchPayload.modules);
+  if ((job?.algorithm_mode || "rl") === algorithm && job?.eval_mode === mode && currentReplay === nextReplay && currentSearch === nextSearch) {
+    updateEvalModeApplyState(lastTrainingStatus);
+    return;
+  }
+
+  trainingModeApplyInFlight = true;
+  updateEvalModeApplyState(lastTrainingStatus);
+  try {
+    const res = await fetchJSON("/api/training/apply-eval-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
+    });
+    selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
+    renderDataFileCard(res.data_file);
+    await refreshOverview();
+    if (res.job) {
+      updateTrainingUI({ active: true, job: res.job, log_tail: [] }, null);
+    }
+  } catch (e) {
+    $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } finally {
+    trainingModeApplyInFlight = false;
+    updateEvalModeApplyState(lastTrainingStatus);
+  }
+}
+
+async function startTraining() {
+  if (trainingRequestInFlight || lastTrainingStatus?.active) return;
+  trainingRequestInFlight = true;
   if (!selectedDataFile) {
+    trainingRequestInFlight = false;
+    await logClientError("请先选择数据文件");
+    return;
+  }
+  const pendingAt = setTrainingActionPending("start");
+  try {
+    await waitForNextPaint();
+    const res = await fetchJSON("/api/training/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: false, algorithm_mode: getAlgorithmMode(), eval_mode: getEvalMode(), replay_policy: scopedReplayConfigForAlgorithm(), search_plugins: scopedSearchConfigForAlgorithm() }),
+    });
+    selectedSymbol = res.data_file?.symbol || res.job?.symbol;
+    renderDataFileCard(res.data_file);
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
+    if (res.job) {
+      updateTrainingUI({ active: true, job: res.job, log_tail: [] }, null);
+    }
+    await refreshOverview();
+  } catch (e) {
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
+    $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } finally {
+    trainingRequestInFlight = false;
+    if (trainingStartPending) setTrainingActionPending(null);
+  }
+}
+
+async function waitForTrainingInactive(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await fetchJSON("/api/training/status", { silent: true });
+    lastTrainingStatus = status;
+    if (!status?.active) return status;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("等待当前训练停止超时");
+}
+
+async function retrainFromScratch() {
+  if (trainingRequestInFlight) return;
+  const activeJob = lastTrainingStatus?.active ? lastTrainingStatus.job : null;
+  const dataFile = activeJob?.data_file || selectedDataFile;
+  if (!dataFile) {
     await logClientError("请先选择数据文件");
     return;
   }
   const ok = window.confirm(
-    "重新训练会清除该品种的检查点，从第 0 步重新搜索。\n" +
+    (activeJob ? "当前训练会先停止，然后重新训练。\n" : "") +
+      "重新训练会清除该品种的检查点，从第 0 步重新搜索。\n" +
       "已有的更优策略会保留，只有挖到更高分才会覆盖。\n\n" +
       "确定要重新训练吗？"
   );
   if (!ok) return;
+  trainingRequestInFlight = true;
+  const pendingAt = setTrainingActionPending("retrain");
   try {
+    await waitForNextPaint();
+    if (activeJob) {
+      await fetchJSON("/api/training/stop", { method: "POST" });
+      await waitForTrainingInactive();
+    }
     const res = await fetchJSON("/api/training/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data_file: selectedDataFile, from_scratch: true, eval_mode: getEvalMode() }),
+      body: JSON.stringify({ data_file: dataFile, from_scratch: true, algorithm_mode: getAlgorithmMode(), eval_mode: getEvalMode(), replay_policy: scopedReplayConfigForAlgorithm(), search_plugins: scopedSearchConfigForAlgorithm() }),
     });
     selectedSymbol = res.data_file?.symbol || res.job?.symbol;
     renderDataFileCard(res.data_file);
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
+    if (res.job) {
+      updateTrainingUI({ active: true, job: res.job, log_tail: [] }, null);
+    }
     await refreshOverview();
   } catch (e) {
+    await waitForLaunchPendingMinimum(pendingAt);
+    setTrainingActionPending(null);
     $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } finally {
+    trainingRequestInFlight = false;
+    if (trainingStartPending) setTrainingActionPending(null);
   }
 }
 
@@ -1237,6 +2041,7 @@ function updateExportBtn(progress, strategies) {
 }
 
 function updateTrainingBtns(progress, training) {
+  if (trainingStartPending) return;
   const sym = progress?.symbol || selectedSymbol;
   const active = training?.active;
   const hasCheckpoint = Boolean(progress?.has_checkpoint);
@@ -1378,13 +2183,21 @@ async function exportStrategy() {
 }
 
 async function stopTraining() {
+  if (trainingRequestInFlight || !lastTrainingStatus?.active) return;
+  trainingRequestInFlight = true;
+  setTrainingActionPending("stop");
   try {
     const res = await fetchJSON("/api/training/stop", { method: "POST" });
+    setTrainingActionPending(null);
     await refreshOverview();
     const sym = res.training?.job?.symbol || selectedSymbol;
     await applyBestStrategyForBacktest(sym, res.strategy_file);
   } catch (e) {
+    setTrainingActionPending(null);
     $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } finally {
+    trainingRequestInFlight = false;
+    if (trainingStartPending) setTrainingActionPending(null);
   }
 }
 
