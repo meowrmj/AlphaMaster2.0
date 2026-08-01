@@ -121,6 +121,39 @@ function scopedSearchConfigForAlgorithm() {
   return getSearchConfig();
 }
 
+function selectedTrainingModeConfig() {
+  const replayPayload = scopedReplayConfigForAlgorithm();
+  const searchPayload = scopedSearchConfigForAlgorithm();
+  return {
+    algorithm_mode: getAlgorithmMode(),
+    eval_mode: getEvalMode(),
+    replay_policy: replayPayload,
+    search_plugins: searchPayload,
+    replay_name: replayPolicyFromModules(replayPayload.modules),
+    search_key: JSON.stringify(normalizeSearchConfig(searchPayload).modules),
+  };
+}
+
+function sameTrainingModeConfig(job, desired) {
+  if (!job || !desired) return false;
+  const activeReplay = job.replay_config
+    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
+    : (job.replay_policy || "qd_incubation");
+  const activeSearch = JSON.stringify(normalizeSearchConfig(job.search_config).modules);
+  return (job.algorithm_mode || "rl") === desired.algorithm_mode
+    && (job.eval_mode || "cpu_batch") === desired.eval_mode
+    && activeReplay === desired.replay_name
+    && activeSearch === desired.search_key;
+}
+
+function assertAppliedTrainingMode(job, desired) {
+  if (!sameTrainingModeConfig(job, desired)) {
+    const activeSearch = searchPluginSummary(job?.search_config);
+    const desiredSearch = searchPluginSummary(desired?.search_plugins);
+    throw new Error(`训练配置没有真正应用：后台=${algorithmModeLabel(job?.algorithm_mode || "rl")} / ${evalModeLabel(job?.eval_mode || "cpu_batch")} / ${activeSearch}，目标=${algorithmModeLabel(desired?.algorithm_mode || "rl")} / ${evalModeLabel(desired?.eval_mode || "cpu_batch")} / ${desiredSearch}`);
+  }
+}
+
 function syncAlgorithmScopedControls() {
   syncEvalOptionsForAlgorithm();
   const mode = getAlgorithmMode();
@@ -1803,28 +1836,6 @@ function updateEvalModeApplyState(training) {
   hint.textContent = selectedAlgorithm === "ga"
     ? `当前未运行；下次启动：独立遗传算法 GA / ${evalModeLabel(selectedMode)}。GA 使用独立种群和独立历史，不使用 RL 的精英回放插件。`
     : `当前未运行；下次启动：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。`;
-  return;
-
-  if (trainingModeApplyInFlight) {
-    hint.textContent = `正在应用：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。会先保存当前节点，再按新设置续跑。`;
-    return;
-  }
-
-  if (active) {
-    hint.textContent = changed
-      ? `当前训练：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。切换后会自动保存当前节点，再按新设置续跑。`
-      : `当前训练已使用：${algorithmModeLabel(activeAlgorithm)} / ${evalModeLabel(activeMode)} / ${replayPolicyLabel(activeReplay)} / ${activeSearch}。`;
-    return;
-  }
-
-  if (job?.data_file) {
-    hint.textContent = `当前没有运行训练；已选择：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。下次点“开始训练”才会按这个设置续跑。`;
-    return;
-  }
-
-  hint.textContent = selectedAlgorithm === "ga"
-    ? `当前未运行；下次启动：独立遗传算法 GA / ${evalModeLabel(selectedMode)}。GA 使用独立种群和独立历史，不使用 RL 的精英回放插件。`
-    : `当前未运行；下次启动：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。`;
 }
 
 function restoreControlsFromTrainingJob(job) {
@@ -1886,36 +1897,27 @@ function syncRunningTrainingControls(job) {
 }
 
 async function handleTrainingModeSelectionChange(options = {}) {
+  const desired = selectedTrainingModeConfig();
   updateEvalModeApplyState(lastTrainingStatus);
   if (!lastTrainingStatus?.active) {
     await refreshOverview();
     return;
   }
   if (!options.userInitiated || trainingStartPending || trainingModeApplyInFlight) return;
-  if ((lastTrainingStatus?.job?.algorithm_mode || "rl") !== getAlgorithmMode()) return;
-  await applySelectedModeToActiveTraining();
+  if ((lastTrainingStatus?.job?.algorithm_mode || "rl") !== desired.algorithm_mode) return;
+  await applySelectedModeToActiveTraining(desired);
 }
 
-async function applySelectedModeToActiveTraining() {
+async function applySelectedModeToActiveTraining(desired = selectedTrainingModeConfig()) {
   if (trainingModeApplyInFlight) return;
-  const mode = getEvalMode();
-  const algorithm = getAlgorithmMode();
-  const replayPayload = scopedReplayConfigForAlgorithm();
-  const searchPayload = scopedSearchConfigForAlgorithm();
   const job = lastTrainingStatus?.job;
   if (!lastTrainingStatus?.active || !job) return;
-  if ((job?.algorithm_mode || "rl") !== algorithm) {
+  if ((job?.algorithm_mode || "rl") !== desired.algorithm_mode) {
     updateEvalModeApplyState(lastTrainingStatus);
     return;
   }
 
-  const currentReplay = job?.replay_config
-    ? replayPolicyFromModules(normalizeReplayConfig(job.replay_config).modules)
-    : (job?.replay_policy || "qd_incubation");
-  const currentSearch = JSON.stringify(normalizeSearchConfig(job?.search_config).modules);
-  const nextReplay = replayPolicyFromModules(replayPayload.modules);
-  const nextSearch = JSON.stringify(searchPayload.modules);
-  if ((job?.algorithm_mode || "rl") === algorithm && job?.eval_mode === mode && currentReplay === nextReplay && currentSearch === nextSearch) {
+  if (sameTrainingModeConfig(job, desired)) {
     updateEvalModeApplyState(lastTrainingStatus);
     return;
   }
@@ -1926,8 +1928,14 @@ async function applySelectedModeToActiveTraining() {
     const res = await fetchJSON("/api/training/apply-eval-mode", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ algorithm_mode: algorithm, eval_mode: mode, replay_policy: replayPayload, search_plugins: searchPayload }),
+      body: JSON.stringify({
+        algorithm_mode: desired.algorithm_mode,
+        eval_mode: desired.eval_mode,
+        replay_policy: desired.replay_policy,
+        search_plugins: desired.search_plugins,
+      }),
     });
+    assertAppliedTrainingMode(res.job, desired);
     selectedSymbol = res.data_file?.symbol || res.job?.symbol || selectedSymbol;
     renderDataFileCard(res.data_file);
     await refreshOverview();
@@ -1935,6 +1943,8 @@ async function applySelectedModeToActiveTraining() {
       updateTrainingUI({ active: true, job: res.job, log_tail: [] }, null);
     }
   } catch (e) {
+    await logClientError(e?.message || String(e), { path: "/api/training/apply-eval-mode", desired });
+    restoreControlsFromTrainingJob(lastTrainingStatus?.job);
     $("debugView").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } finally {
     trainingModeApplyInFlight = false;
