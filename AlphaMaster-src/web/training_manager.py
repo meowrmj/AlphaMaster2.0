@@ -27,6 +27,8 @@ ALGORITHM_MODES = {"rl", "ga", "hybrid"}
 REPLAY_MODULES = {"qd", "incubation"}
 REPLAY_POLICIES = {"qd_incubation", "qd", "incubation", "none"}
 SEARCH_MODULES = {"annealing", "genetic"}
+VCVARS64_BAT = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
+CUDA_HOME = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
 
 
 def _normalize_eval_mode(value: str | None) -> str:
@@ -109,6 +111,41 @@ def _apply_eval_mode_env(env: dict[str, str], eval_mode: str) -> None:
         env["ALPHAMASTER_GPU_BATCH_EVAL"] = "1"
         env["ALPHAMASTER_GPU_BATCH_EVAL_STRICT"] = "1"
         env["ALPHAMASTER_NATIVE_FORMULA_OPS"] = "0"
+
+
+def _apply_native_toolchain_env(env: dict[str, str]) -> None:
+    """Inject the MSVC/CUDA build environment needed by torch C++ extensions."""
+    if os.name != "nt":
+        return
+    if not VCVARS64_BAT.exists():
+        raise RuntimeError(f"native CUDA toolchain missing: {VCVARS64_BAT}")
+    nvcc = CUDA_HOME / "bin" / "nvcc.exe"
+    if not nvcc.exists():
+        raise RuntimeError(f"native CUDA nvcc missing: {nvcc}")
+
+    cmd = f'call "{VCVARS64_BAT}" >nul && set'
+    output = subprocess.check_output(
+        cmd,
+        shell=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            env[key] = value
+    cuda_home = str(CUDA_HOME)
+    env["CUDA_HOME"] = cuda_home
+    env["CUDA_PATH"] = cuda_home
+    vc_tools = env.get("VCToolsInstallDir", "")
+    cl_dir = Path(vc_tools) / "bin" / "Hostx64" / "x64" if vc_tools else None
+    prefix = [str(CUDA_HOME / "bin"), str(CUDA_HOME / "libnvvp")]
+    if cl_dir and (cl_dir / "cl.exe").exists():
+        prefix.insert(0, str(cl_dir))
+    env["PATH"] = ";".join(prefix + [env.get("PATH", "")])
 
 
 class JobState(str, Enum):
@@ -226,6 +263,8 @@ class TrainingManager:
             replay_policy, replay_config = _normalize_replay_config(replay_policy)
             search_config = _normalize_search_config(search_plugins)
             _apply_eval_mode_env(env, eval_mode)
+            if eval_mode == "cuda_batch":
+                _apply_native_toolchain_env(env)
             env["ALPHAMASTER_ALGORITHM_MODE"] = algorithm_mode
             env["ALPHAMASTER_REPLAY_POLICY"] = replay_policy
             env["ALPHAMASTER_REPLAY_CONFIG"] = json.dumps(replay_config, ensure_ascii=False, separators=(",", ":"))
