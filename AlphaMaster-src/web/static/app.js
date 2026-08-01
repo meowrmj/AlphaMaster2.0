@@ -3583,11 +3583,11 @@ function startPolling() {
 async function init() {
   try {
     await loadConfig();
-    await refreshOverview();
   } catch (e) {
     await logClientError("初始化失败: " + e.message);
   }
   initEvalModeSelect();
+  await refreshOverview();
   $("browseBtn").addEventListener("click", browseDataFile);
   if ($("dataRootBrowseBtn")) $("dataRootBrowseBtn").addEventListener("click", browseDataRootDir);
   if ($("dataRootSaveBtn")) $("dataRootSaveBtn").addEventListener("click", saveDataRootDir);
