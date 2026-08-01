@@ -11,6 +11,7 @@ let replayPolicy = localStorage.getItem("alphamaster_replay_policy") || "qd_incu
 let replayConfig = null;
 let searchConfig = null;
 let replayPolicyPage = 0;
+let replayPolicyDraftDirty = false;
 let chart = null;
 let chartSymbol = null;
 let chartZoom = { min: null, max: null };
@@ -170,6 +171,8 @@ function syncAlgorithmScopedControls() {
   updateReplayPolicySummary();
   if (trainingStartPending || trainingModeApplyInFlight || trainingAlgorithmSwitchInFlight) {
     setTrainingModeControlsDisabled(true);
+  } else {
+    setTrainingModeControlsDisabled(false);
   }
 }
 
@@ -312,6 +315,22 @@ function renderReplayPolicyPage() {
   if (next) next.disabled = locked || replayPolicyPage >= pages.length - 1;
 }
 
+function markReplayPolicyDraftDirty() {
+  replayPolicyDraftDirty = true;
+  updateEvalModeApplyState(lastTrainingStatus);
+}
+
+async function applyReplayPolicyDraftOnClose() {
+  if (!replayPolicyDraftDirty) return;
+  if (trainingStartPending || trainingModeApplyInFlight || trainingAlgorithmSwitchInFlight) return;
+  replayPolicyDraftDirty = false;
+  if (getAlgorithmMode() === "ga") {
+    updateEvalModeApplyState(lastTrainingStatus);
+    return;
+  }
+  await handleTrainingModeSelectionChange({ userInitiated: true });
+}
+
 function initEvalModeSelect() {
   const algorithmSelect = $("algorithmModeSelect");
   const select = $("evalModeSelect");
@@ -346,7 +365,7 @@ function initEvalModeSelect() {
     saveReplayConfig(getReplayConfig());
     const onReplayPolicyChange = () => {
       saveReplayConfig(getReplayConfig());
-      handleTrainingModeSelectionChange({ userInitiated: true });
+      markReplayPolicyDraftDirty();
     };
     replayInputs.forEach((input) => input.addEventListener("change", onReplayPolicyChange));
     searchConfig = normalizeSearchConfig(searchConfig);
@@ -356,9 +375,14 @@ function initEvalModeSelect() {
     saveSearchConfig(getSearchConfig());
     const onSearchConfigChange = () => {
       saveSearchConfig(getSearchConfig());
-      handleTrainingModeSelectionChange({ userInitiated: true });
+      markReplayPolicyDraftDirty();
     };
     searchInputs.forEach((input) => input.addEventListener("change", onSearchConfigChange));
+    $("replayPolicyPanel")?.addEventListener("toggle", async (event) => {
+      if (!event.currentTarget.open) {
+        await applyReplayPolicyDraftOnClose();
+      }
+    });
     $("replayPolicyPrevBtn")?.addEventListener("click", () => {
             replayPolicyPage -= 1;
             renderReplayPolicyPage();
@@ -1834,6 +1858,13 @@ function updateEvalModeApplyState(training) {
 
   if (trainingModeApplyInFlight) {
     hint.textContent = `正在应用：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。会先保存当前节点，再按新设置续跑。`;
+    return;
+  }
+
+  if (replayPolicyDraftDirty) {
+    hint.textContent = active && selectedAlgorithm === activeAlgorithm
+      ? `已修改为：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。收起“精英/回放策略”后会一次性应用整组设置。`
+      : `已修改为：${algorithmModeLabel(selectedAlgorithm)} / ${evalModeLabel(selectedMode)} / ${replayPolicyLabel(selectedReplay)} / ${selectedSearch}。收起“精英/回放策略”后保存选择，下次开始训练生效。`;
     return;
   }
 
