@@ -37,6 +37,7 @@ constexpr int OP_TS_SUM_10 = 410;
 constexpr int OP_TS_SUM_20 = 420;
 constexpr int OP_TS_ZSCORE_10 = 510;
 constexpr int OP_TS_ZSCORE_20 = 520;
+constexpr int OP_WINSORIZE = 580;
 constexpr int OP_TS_STD_5 = 605;
 constexpr int OP_TS_STD_10 = 610;
 constexpr int OP_TS_STD_20 = 620;
@@ -48,6 +49,7 @@ constexpr int OP_TS_MIN_20 = 820;
 constexpr int OP_TS_MAX_10 = 910;
 constexpr int OP_TS_MAX_20 = 920;
 constexpr int OP_TS_QUANTILE_10 = 1010;
+constexpr int OP_TS_SKEW_10 = 1020;
 constexpr int OP_TS_ARG_MAX_5 = 1105;
 constexpr int OP_TS_ARG_MIN_5 = 1205;
 constexpr int OP_DECAY = 1303;
@@ -144,12 +146,12 @@ __device__ __forceinline__ int window_for_op(int64_t op_id) {
   }
   if (op_id == OP_TS_MEAN_10 || op_id == OP_TS_SUM_10 || op_id == OP_TS_ZSCORE_10 ||
       op_id == OP_TS_STD_10 || op_id == OP_TS_RANK_10 || op_id == OP_TS_MIN_10 ||
-      op_id == OP_TS_MAX_10 || op_id == OP_TS_QUANTILE_10) {
+      op_id == OP_TS_MAX_10 || op_id == OP_TS_QUANTILE_10 || op_id == OP_TS_SKEW_10) {
     return 10;
   }
   if (op_id == OP_TS_MEAN_20 || op_id == OP_TS_SUM_20 || op_id == OP_TS_ZSCORE_20 ||
       op_id == OP_TS_STD_20 || op_id == OP_TS_RANK_20 || op_id == OP_TS_MIN_20 ||
-      op_id == OP_TS_MAX_20) {
+      op_id == OP_TS_MAX_20 || op_id == OP_WINSORIZE) {
     return 20;
   }
   if (op_id == OP_TS_STD_5 || op_id == OP_TS_RANK_5 || op_id == OP_TS_ARG_MAX_5 ||
@@ -166,6 +168,34 @@ __device__ __forceinline__ scalar_t value_at(
     int64_t t,
     int64_t n_bars) {
   return (t >= 0 && t < n_bars) ? a[base + t] : static_cast<scalar_t>(0);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void sort_window(scalar_t* values, int n) {
+  for (int i = 1; i < n; ++i) {
+    scalar_t key = values[i];
+    int j = i - 1;
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      --j;
+    }
+    values[j + 1] = key;
+  }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t quantile_linear_sorted(
+    const scalar_t* values,
+    int n,
+    scalar_t q) {
+  scalar_t pos = q * static_cast<scalar_t>(n - 1);
+  int lo = static_cast<int>(floor(pos));
+  int hi = lo + 1;
+  if (hi >= n) {
+    hi = n - 1;
+  }
+  scalar_t weight = pos - static_cast<scalar_t>(lo);
+  return values[lo] * (static_cast<scalar_t>(1) - weight) + values[hi] * weight;
 }
 
 template <typename scalar_t>
@@ -249,6 +279,21 @@ __global__ void rolling1_kernel(
     scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
     scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
     out_v = (cur - mean) / (std_v + static_cast<scalar_t>(1e-6));
+  } else if (op_id == OP_WINSORIZE) {
+    scalar_t values[20];
+    for (int k = 0; k < 20; ++k) {
+      int64_t src_t = t - (19 - k);
+      values[k] = value_at(a, base, src_t, n_bars);
+    }
+    sort_window(values, 20);
+    scalar_t lower = quantile_linear_sorted(values, 20, static_cast<scalar_t>(0.05));
+    scalar_t upper = quantile_linear_sorted(values, 20, static_cast<scalar_t>(0.95));
+    scalar_t span = upper - lower;
+    if (span < static_cast<scalar_t>(1e-9)) {
+      lower = cur;
+      upper = cur;
+    }
+    out_v = cur < lower ? lower : (cur > upper ? upper : cur);
   } else if (op_id == OP_TS_RANK_5 || op_id == OP_TS_RANK_10 || op_id == OP_TS_RANK_20 ||
              op_id == OP_TS_QUANTILE_10) {
     out_v = static_cast<scalar_t>(rank_count) / static_cast<scalar_t>(w);
@@ -302,6 +347,22 @@ __global__ void rolling1_kernel(
     scalar_t d2 = value_at(a, base, t - 2, n_bars);
     out_v = cur > d1 ? cur : d1;
     out_v = out_v > d2 ? out_v : d2;
+  } else if (op_id == OP_TS_SKEW_10) {
+    scalar_t mean = sum / static_cast<scalar_t>(w);
+    scalar_t var = sum_sq / static_cast<scalar_t>(w) - mean * mean;
+    scalar_t std_v = sqrt(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0)) + static_cast<scalar_t>(1e-6);
+    scalar_t skew_sum = static_cast<scalar_t>(0);
+    for (int k = 0; k < 10; ++k) {
+      int64_t src_t = t - (9 - k);
+      scalar_t z = (value_at(a, base, src_t, n_bars) - mean) / std_v;
+      skew_sum += z * z * z;
+    }
+    out_v = skew_sum / static_cast<scalar_t>(10);
+    if (out_v < static_cast<scalar_t>(-5.0)) {
+      out_v = static_cast<scalar_t>(-5.0);
+    } else if (out_v > static_cast<scalar_t>(5.0)) {
+      out_v = static_cast<scalar_t>(5.0);
+    }
   }
   out[i] = sanitize(out_v);
 }
