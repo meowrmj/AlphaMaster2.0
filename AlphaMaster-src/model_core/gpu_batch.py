@@ -46,6 +46,8 @@ class BatchStackVM3D:
         self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(BATCH_OPS_CONFIG)}
         self.native_ops = None
         self._native_status_logged = False
+        self._fused_plan_cache: dict[tuple[tuple[int, ...], ...], dict[int, list[tuple[str, str, str, Tensor]]]] = {}
+        self._stage_op_plan_cache: dict[tuple[tuple[int, ...], ...], dict[int, list[tuple[int, Tensor]]]] = {}
 
     def _native(self, device: torch.device):
         enabled = os.getenv("ALPHAMASTER_NATIVE_FORMULA_OPS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -64,6 +66,100 @@ class BatchStackVM3D:
                 )
                 self._native_status_logged = True
         return self.native_ops
+
+    def _build_fused_plan(
+        self,
+        formulas: Tensor,
+        native,
+        device: torch.device,
+    ) -> dict[int, list[tuple[str, str, str, Tensor]]]:
+        if native is None:
+            return {}
+        key = tuple(tuple(int(t) for t in row) for row in formulas.detach().cpu().tolist())
+        cached = self._fused_plan_cache.get(key)
+        if cached is not None:
+            return {
+                step: [(kind, op_name, next_op_name, idx.to(device=device)) for kind, op_name, next_op_name, idx in groups]
+                for step, groups in cached.items()
+            }
+
+        plan: dict[int, list[tuple[str, str, str, Tensor]]] = {}
+        rows = key
+        if not rows:
+            return plan
+        max_len = len(rows[0])
+        for step in range(max_len - 1):
+            groups: dict[tuple[str, str, str], list[int]] = {}
+            for row_idx, row in enumerate(rows):
+                op_tok = row[step]
+                next_tok = row[step + 1]
+                if op_tok < self.feat_offset or next_tok < self.feat_offset:
+                    continue
+                if op_tok not in self.op_map or next_tok not in self.op_map:
+                    continue
+                arity = self.arity_map[op_tok]
+                next_arity = self.arity_map[next_tok]
+                op_name = self.op_name_map[op_tok]
+                next_op_name = self.op_name_map[next_tok]
+                if arity == 1 and next_arity == 1 and native.supports_shift_unary(op_name, next_op_name):
+                    groups.setdefault(("shift_unary", op_name, next_op_name), []).append(row_idx)
+                elif arity == 2 and next_arity == 3 and native.supports_binary_branch(op_name, next_op_name):
+                    groups.setdefault(("binary_branch", op_name, next_op_name), []).append(row_idx)
+            if groups:
+                plan[step] = [
+                    (
+                        kind,
+                        op_name,
+                        next_op_name,
+                        torch.tensor(indices, dtype=torch.long),
+                    )
+                    for (kind, op_name, next_op_name), indices in groups.items()
+                ]
+
+        if len(self._fused_plan_cache) >= 64:
+            self._fused_plan_cache.clear()
+        self._fused_plan_cache[key] = plan
+        return {
+            step: [(kind, op_name, next_op_name, idx.to(device=device)) for kind, op_name, next_op_name, idx in groups]
+            for step, groups in plan.items()
+        }
+
+    def _build_stage_op_plan(
+        self,
+        formulas: Tensor,
+        device: torch.device,
+    ) -> dict[int, list[tuple[int, Tensor]]]:
+        key = tuple(tuple(int(t) for t in row) for row in formulas.detach().cpu().tolist())
+        cached = self._stage_op_plan_cache.get(key)
+        if cached is not None:
+            return {
+                step: [(op_tok, idx.to(device=device)) for op_tok, idx in groups]
+                for step, groups in cached.items()
+            }
+
+        plan: dict[int, list[tuple[int, Tensor]]] = {}
+        if not key:
+            return plan
+        max_len = len(key[0])
+        for step in range(max_len):
+            groups: dict[int, list[int]] = {}
+            for row_idx, row in enumerate(key):
+                tok = int(row[step])
+                if tok >= self.feat_offset:
+                    groups.setdefault(tok, []).append(row_idx)
+            if groups:
+                plan[step] = [
+                    (op_tok, torch.tensor(indices, dtype=torch.long))
+                    for op_tok, indices in groups.items()
+                ]
+
+        if len(self._stage_op_plan_cache) >= 64:
+            self._stage_op_plan_cache.clear()
+        self._stage_op_plan_cache[key] = plan
+        return {
+            step: [(op_tok, idx.to(device=device)) for op_tok, idx in groups]
+            for step, groups in plan.items()
+        }
 
     def _apply_op(self, op_name: str, op_func, args: list[Tensor], device: torch.device) -> Tensor:
         native = self._native(device)
@@ -118,6 +214,9 @@ class BatchStackVM3D:
         valid = torch.ones(bsz, dtype=torch.bool, device=feat_tensor.device)
         skip_next = torch.zeros(bsz, dtype=torch.bool, device=feat_tensor.device)
         feat_bank = feat_tensor.permute(1, 0, 2)
+        native = self._native(feat_tensor.device)
+        fused_plan = self._build_fused_plan(formulas, native, feat_tensor.device)
+        stage_op_plan = self._build_stage_op_plan(formulas, feat_tensor.device)
 
         for step in range(max_len):
             tok = formulas[:, step]
@@ -137,130 +236,109 @@ class BatchStackVM3D:
                 if (~ok).any():
                     valid[idx[~ok]] = False
 
-            op_active = active & (tok >= self.feat_offset)
-            if op_active.any():
-                op_tokens = torch.unique(tok[op_active])
-                for op_tok_t in op_tokens:
-                    op_tok = int(op_tok_t.item())
-                    idx = torch.nonzero(op_active & (tok == op_tok), as_tuple=False).flatten()
-                    if op_tok not in self.op_map:
-                        valid[idx] = False
-                        continue
-                    arity = self.arity_map[op_tok]
-                    enough = ptr[idx] >= arity
-                    if (~enough).any():
-                        valid[idx[~enough]] = False
-                    idx = idx[enough]
+            for op_tok, plan_idx in stage_op_plan.get(step, []):
+                idx = plan_idx[active[plan_idx]]
+                if idx.numel() == 0:
+                    continue
+                if op_tok not in self.op_map:
+                    valid[idx] = False
+                    continue
+                arity = self.arity_map[op_tok]
+                enough = ptr[idx] >= arity
+                if (~enough).any():
+                    valid[idx[~enough]] = False
+                idx = idx[enough]
+                if idx.numel() == 0:
+                    continue
+
+                op_name = self.op_name_map[op_tok]
+                base = ptr[idx] - arity
+                fused_handled = torch.zeros(bsz, dtype=torch.bool, device=feat_tensor.device)
+
+                if native is not None:
+                    for fused_kind, fused_op_name, next_op_name, plan_idx in fused_plan.get(step, []):
+                        if fused_op_name != op_name:
+                            continue
+                        eligible = valid[plan_idx] & ~stage_skip[plan_idx] & (tok[plan_idx] == op_tok)
+                        if fused_kind == "shift_unary":
+                            eligible = eligible & (ptr[plan_idx] >= 1)
+                            idx_fused = plan_idx[eligible]
+                            if idx_fused.numel() == 0:
+                                continue
+                            base_fused = ptr[idx_fused] - 1
+                            try:
+                                res = native.apply_shift_unary(
+                                    op_name,
+                                    next_op_name,
+                                    stack[idx_fused, base_fused, :, :],
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"native fused formula op failed: {op_name}->{next_op_name}"
+                                ) from exc
+                            if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                valid[idx_fused] = False
+                                continue
+                            res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                            stack[idx_fused, base_fused, :, :] = res
+                            ptr[idx_fused] = base_fused + 1
+                            skip_next[idx_fused] = True
+                            fused_handled[idx_fused] = True
+                        elif fused_kind == "binary_branch":
+                            eligible = eligible & (ptr[plan_idx] >= 4)
+                            idx_fused = plan_idx[eligible]
+                            if idx_fused.numel() == 0:
+                                continue
+                            bin_base = ptr[idx_fused] - 2
+                            branch_base = ptr[idx_fused] - 4
+                            try:
+                                res = native.apply_binary_branch(
+                                    op_name,
+                                    next_op_name,
+                                    stack[idx_fused, bin_base, :, :],
+                                    stack[idx_fused, bin_base + 1, :, :],
+                                    stack[idx_fused, branch_base, :, :],
+                                    stack[idx_fused, branch_base + 1, :, :],
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"native fused formula op failed: {op_name}->{next_op_name}"
+                                ) from exc
+                            if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                valid[idx_fused] = False
+                                continue
+                            res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                            stack[idx_fused, branch_base, :, :] = res
+                            ptr[idx_fused] = branch_base + 1
+                            skip_next[idx_fused] = True
+                            fused_handled[idx_fused] = True
+
+                if fused_handled.any():
+                    idx = idx[~fused_handled[idx]]
                     if idx.numel() == 0:
                         continue
-
-                    op_name = self.op_name_map[op_tok]
-                    native = self._native(feat_tensor.device)
                     base = ptr[idx] - arity
 
-                    if arity == 1 and native is not None and step + 1 < max_len:
-                        next_tok = formulas[idx, step + 1]
-                        next_op_mask = next_tok >= self.feat_offset
-                        if next_op_mask.any():
-                            fused_handled = torch.zeros(idx.shape, dtype=torch.bool, device=idx.device)
-                            for next_op_tok_t in torch.unique(next_tok[next_op_mask]):
-                                next_op_tok = int(next_op_tok_t.item())
-                                if next_op_tok not in self.op_map or self.arity_map[next_op_tok] != 1:
-                                    continue
-                                next_op_name = self.op_name_map[next_op_tok]
-                                if not native.supports_shift_unary(op_name, next_op_name):
-                                    continue
-                                sub_mask = next_tok == next_op_tok_t
-                                idx_fused = idx[sub_mask]
-                                base_fused = base[sub_mask]
-                                try:
-                                    res = native.apply_shift_unary(
-                                        op_name,
-                                        next_op_name,
-                                        stack[idx_fused, base_fused, :, :],
-                                    )
-                                except Exception as exc:
-                                    raise RuntimeError(
-                                        f"native fused formula op failed: {op_name}->{next_op_name}"
-                                    ) from exc
-                                if res.shape != (idx_fused.numel(), n_symbols, n_bars):
-                                    valid[idx_fused] = False
-                                    continue
-                                res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
-                                stack[idx_fused, base_fused, :, :] = res
-                                ptr[idx_fused] = base_fused + 1
-                                skip_next[idx_fused] = True
-                                fused_handled |= sub_mask
-                            if fused_handled.any():
-                                idx = idx[~fused_handled]
-                                if idx.numel() == 0:
-                                    continue
-                                base = ptr[idx] - arity
-
-                    if arity == 2 and native is not None and step + 1 < max_len:
-                        next_tok = formulas[idx, step + 1]
-                        next_op_mask = next_tok >= self.feat_offset
-                        branch_ready = ptr[idx] >= 4
-                        if next_op_mask.any() and branch_ready.any():
-                            fused_handled = torch.zeros(idx.shape, dtype=torch.bool, device=idx.device)
-                            for next_op_tok_t in torch.unique(next_tok[next_op_mask & branch_ready]):
-                                next_op_tok = int(next_op_tok_t.item())
-                                if next_op_tok not in self.op_map or self.arity_map[next_op_tok] != 3:
-                                    continue
-                                next_op_name = self.op_name_map[next_op_tok]
-                                if not native.supports_binary_branch(op_name, next_op_name):
-                                    continue
-                                sub_mask = (next_tok == next_op_tok_t) & branch_ready
-                                idx_fused = idx[sub_mask]
-                                bin_base = ptr[idx_fused] - 2
-                                branch_base = ptr[idx_fused] - 4
-                                try:
-                                    res = native.apply_binary_branch(
-                                        op_name,
-                                        next_op_name,
-                                        stack[idx_fused, bin_base, :, :],
-                                        stack[idx_fused, bin_base + 1, :, :],
-                                        stack[idx_fused, branch_base, :, :],
-                                        stack[idx_fused, branch_base + 1, :, :],
-                                    )
-                                except Exception as exc:
-                                    raise RuntimeError(
-                                        f"native fused formula op failed: {op_name}->{next_op_name}"
-                                    ) from exc
-                                if res.shape != (idx_fused.numel(), n_symbols, n_bars):
-                                    valid[idx_fused] = False
-                                    continue
-                                res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
-                                stack[idx_fused, branch_base, :, :] = res
-                                ptr[idx_fused] = branch_base + 1
-                                skip_next[idx_fused] = True
-                                fused_handled |= sub_mask
-                            if fused_handled.any():
-                                idx = idx[~fused_handled]
-                                if idx.numel() == 0:
-                                    continue
-                                base = ptr[idx] - arity
-
-                    native_supported = native is not None and native.supports(op_name, arity)
-                    args = [stack[idx, base + off, :, :] for off in range(arity)]
-                    try:
-                        res = self._apply_op(
-                            op_name,
-                            self.op_map[op_tok],
-                            args,
-                            feat_tensor.device,
-                        )
-                    except Exception as exc:
-                        if native_supported:
-                            raise RuntimeError(f"native formula op failed: {op_name}/{arity}") from exc
-                        valid[idx] = False
-                        continue
-                    if res.shape != (idx.numel(), n_symbols, n_bars):
-                        valid[idx] = False
-                        continue
-                    res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
-                    stack[idx, base, :, :] = res
-                    ptr[idx] = base + 1
+                native_supported = native is not None and native.supports(op_name, arity)
+                args = [stack[idx, base + off, :, :] for off in range(arity)]
+                try:
+                    res = self._apply_op(
+                        op_name,
+                        self.op_map[op_tok],
+                        args,
+                        feat_tensor.device,
+                    )
+                except Exception as exc:
+                    if native_supported:
+                        raise RuntimeError(f"native formula op failed: {op_name}/{arity}") from exc
+                    valid[idx] = False
+                    continue
+                if res.shape != (idx.numel(), n_symbols, n_bars):
+                    valid[idx] = False
+                    continue
+                res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                stack[idx, base, :, :] = res
+                ptr[idx] = base + 1
 
         valid = valid & (ptr == 1)
         factors = torch.zeros(bsz, n_symbols, n_bars, dtype=feat_tensor.dtype, device=feat_tensor.device)
