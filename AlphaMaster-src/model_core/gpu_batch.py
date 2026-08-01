@@ -142,16 +142,21 @@ class BatchStackVM3D:
                     if idx.numel() == 0:
                         continue
 
+                    op_name = self.op_name_map[op_tok]
+                    native = self._native(feat_tensor.device)
+                    native_supported = native is not None and native.supports(op_name, arity)
                     base = ptr[idx] - arity
                     args = [stack[idx, base + off, :, :] for off in range(arity)]
                     try:
                         res = self._apply_op(
-                            self.op_name_map[op_tok],
+                            op_name,
                             self.op_map[op_tok],
                             args,
                             feat_tensor.device,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        if native_supported:
+                            raise RuntimeError(f"native formula op failed: {op_name}/{arity}") from exc
                         valid[idx] = False
                         continue
                     if res.shape != (idx.numel(), n_symbols, n_bars):
