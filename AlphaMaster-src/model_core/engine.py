@@ -1239,6 +1239,7 @@ class AlphaEngine:
             plugin_formulas = search_batch.formulas
             plugin_origins = search_batch.origins
             n_plugin = len(plugin_formulas)
+            n_plugin_requested = n_plugin
             n_policy = max(0, n_new - n_plugin)
             memory_formulas = replay_batch.formulas
             n_memory = len(memory_formulas)
@@ -1444,34 +1445,100 @@ class AlphaEngine:
             # factor_pool 快照：所有 worker 看到同一份只读视图
             factor_pool_snapshot = list(self.factor_pool)
 
-            # 并行提交所有公式评估任务
-            if ModelConfig.GPU_BATCH_EVAL and use_wf:
-                results = self._eval_formula_batch_tasks(
-                    step, all_fmls, feat, t_ret, folds, use_wf, factor_pool_snapshot,
+            def eval_formula_list(batch_fmls: list[list[int]]) -> list[dict]:
+                if not batch_fmls:
+                    return []
+                if ModelConfig.GPU_BATCH_EVAL and use_wf:
+                    batch_results = self._eval_formula_batch_tasks(
+                        step, batch_fmls, feat, t_ret, folds, use_wf, factor_pool_snapshot,
+                    )
+                elif self._eval_pool is not None and self._eval_workers > 1 and len(batch_fmls) > 1:
+                    futures = [
+                        self._eval_pool.submit(
+                            self._eval_formula_task, i, fml, feat, t_ret,
+                            folds, use_wf, factor_pool_snapshot,
+                        )
+                        for i, fml in enumerate(batch_fmls)
+                    ]
+                    results_by_idx: dict[int, dict] = {}
+                    for fut in futures:
+                        r = fut.result()
+                        results_by_idx[r['idx']] = r
+                    batch_results = [results_by_idx[i] for i in range(len(batch_fmls))]
+                else:
+                    batch_results = [
+                        self._eval_formula_task(
+                            i, fml, feat, t_ret,
+                            folds, use_wf, factor_pool_snapshot,
+                        )
+                        for i, fml in enumerate(batch_fmls)
+                    ]
+                for idx, item in enumerate(batch_results):
+                    item['idx'] = idx
+                return batch_results
+
+            results = eval_formula_list(all_fmls)
+            self.search_plugins.reset_observe_info()
+            policy_results = results[:len(seqs_new_list)]
+            plugin_results_initial = results[len(seqs_new_list):len(seqs_new_list) + len(plugin_formulas)]
+            memory_results = results[len(seqs_new_list) + len(plugin_formulas):]
+            selected_plugin_results: list[dict] = []
+            selected_plugin_origins: list[str] = []
+            search_refill_rounds = 0
+
+            def accept_plugin_results(candidate_results: list[dict], candidate_origins: list[str]) -> None:
+                nonlocal selected_plugin_results, selected_plugin_origins
+                if not candidate_results:
+                    return
+                info = self.search_plugins.observe(
+                    step=step,
+                    results=candidate_results,
+                    origins=candidate_origins,
                 )
-            elif self._eval_pool is not None and self._eval_workers > 1 and tot > 1:
-                from concurrent.futures import ThreadPoolExecutor
-                futures = [
-                    self._eval_pool.submit(
-                        self._eval_formula_task, i, fml, feat, t_ret,
-                        folds, use_wf, factor_pool_snapshot,
-                    )
-                    for i, fml in enumerate(all_fmls)
-                ]
-                results_by_idx: dict[int, dict] = {}
-                for fut in futures:
-                    r = fut.result()
-                    results_by_idx[r['idx']] = r
-                results = [results_by_idx[i] for i in range(tot)]
-            else:
-                # 串行回退
-                results = [
-                    self._eval_formula_task(
-                        i, fml, feat, t_ret,
-                        folds, use_wf, factor_pool_snapshot,
-                    )
-                    for i, fml in enumerate(all_fmls)
-                ]
+                accepted_counts: dict[tuple[int, ...], int] = {}
+                for formula in info.get("accepted_formulas_current", []):
+                    key = formula_key(formula)
+                    accepted_counts[key] = accepted_counts.get(key, 0) + 1
+                if not accepted_counts:
+                    return
+                for result, origin in zip(candidate_results, candidate_origins):
+                    key = formula_key(result.get("fml") or [])
+                    remaining = accepted_counts.get(key, 0)
+                    if remaining > 0:
+                        selected_plugin_results.append(result)
+                        selected_plugin_origins.append(origin)
+                        accepted_counts[key] = remaining - 1
+
+            accept_plugin_results(plugin_results_initial, plugin_origins)
+            max_refill_rounds = max(0, int(getattr(ModelConfig, "SEARCH_REFILL_ROUNDS", 0)))
+            while len(selected_plugin_results) < len(plugin_formulas) and search_refill_rounds < max_refill_rounds:
+                needed = len(plugin_formulas) - len(selected_plugin_results)
+                refill_batch = self.search_plugins.plan(
+                    step=step,
+                    candidate_slots=needed,
+                    best_formula=self.best_formula,
+                    elite_pool=self.replay_policy.elite_entries(),
+                )
+                if not refill_batch.formulas:
+                    break
+                search_refill_rounds += 1
+                refill_results = eval_formula_list(refill_batch.formulas)
+                accept_plugin_results(refill_results, refill_batch.origins)
+
+            plugin_formulas = [list(result.get("fml") or []) for result in selected_plugin_results]
+            plugin_origins = selected_plugin_origins
+            n_plugin = len(plugin_formulas)
+            all_results = policy_results + selected_plugin_results + memory_results
+            results = []
+            for idx, item in enumerate(all_results):
+                updated = dict(item)
+                updated['idx'] = idx
+                results.append(updated)
+            formula_origins = (["policy"] * len(policy_results)) + plugin_origins + (["memory"] * len(memory_results))
+            all_fmls = [list(result.get("fml") or []) for result in results]
+            tot = len(results)
+            reward_values = [0.0] * tot
+            val_score_values = [0.0] * tot
             timing_eval_ms = (time.perf_counter() - timing_eval0) * 1000.0
 
             # ── 串行后处理：写入 rewards/val_scores，更新冠军/池 ─────────
@@ -1559,34 +1626,6 @@ class AlphaEngine:
 
             rewards = torch.tensor(reward_values, dtype=torch.float32, device=ModelConfig.DEVICE)
             val_scores = torch.tensor(val_score_values, dtype=torch.float32, device=ModelConfig.DEVICE)
-            plugin_results = [
-                results[i] for i, origin in enumerate(formula_origins)
-                if origin in {"annealing", "genetic"}
-            ]
-            plugin_result_origins = [
-                origin for origin in formula_origins
-                if origin in {"annealing", "genetic"}
-            ]
-            search_observe_info = self.search_plugins.observe(
-                step=step,
-                results=plugin_results,
-                origins=plugin_result_origins,
-            )
-            accepted_plugin_formulas = {
-                formula_key(formula)
-                for formula in search_observe_info.get("accepted_formulas", [])
-            }
-            if accepted_plugin_formulas:
-                replay_observations = [
-                    item for item in replay_observations
-                    if item.get("origin") not in {"annealing", "genetic"}
-                    or formula_key(item.get("formula") or []) in accepted_plugin_formulas
-                ]
-            else:
-                replay_observations = [
-                    item for item in replay_observations
-                    if item.get("origin") not in {"annealing", "genetic"}
-                ]
             self.replay_policy.observe_many(
                 replay_observations,
                 step=step,
@@ -1812,6 +1851,8 @@ class AlphaEngine:
             self.training_history.setdefault('incubation_replay_used', []).append(n_incubate)
             self.training_history.setdefault('policy_generated_used', []).append(n_policy)
             self.training_history.setdefault('search_plugin_used', []).append(n_plugin)
+            self.training_history.setdefault('search_plugin_requested', []).append(n_plugin_requested)
+            self.training_history.setdefault('search_refill_rounds', []).append(search_refill_rounds)
             self.training_history.setdefault('search_plugin_modules', []).append(
                 ",".join(search_metrics.get("search_plugins") or []))
             self.training_history.setdefault('search_archive_size', []).append(

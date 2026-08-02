@@ -109,6 +109,15 @@ class SearchPluginManager:
             origins.extend([name] * len(batch))
         return SearchBatch(formulas, origins, self.metrics() | {"planned": len(formulas)})
 
+    def reset_observe_info(self) -> None:
+        self._last_observe_info = {
+            "evaluated": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "accepted_formulas": [],
+            "accepted_formulas_current": [],
+        }
+
     def observe(self, *, step: int, results: list[dict], origins: list[str]) -> dict[str, Any]:
         archive_entries: list[ReplayEntry] = []
         for r, origin in zip(results, origins):
@@ -134,11 +143,13 @@ class SearchPluginManager:
             self.archive = self._rebalance_with_behavior(self.archive + accepted)
             self._prune_behavior_memory()
         accepted_formulas = [list(entry[2]) for entry in accepted]
+        previous_formulas = list(self._last_observe_info.get("accepted_formulas") or [])
         self._last_observe_info = {
-            "evaluated": len(archive_entries),
-            "accepted": len(accepted),
-            "rejected": max(0, len(archive_entries) - len(accepted)),
-            "accepted_formulas": accepted_formulas,
+            "evaluated": int(self._last_observe_info.get("evaluated") or 0) + len(archive_entries),
+            "accepted": int(self._last_observe_info.get("accepted") or 0) + len(accepted),
+            "rejected": int(self._last_observe_info.get("rejected") or 0) + max(0, len(archive_entries) - len(accepted)),
+            "accepted_formulas": previous_formulas + accepted_formulas,
+            "accepted_formulas_current": accepted_formulas,
         }
         return dict(self._last_observe_info)
 

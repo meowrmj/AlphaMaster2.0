@@ -136,6 +136,7 @@ class ModelConfig:
     SEARCH_BUCKET_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_BUCKET_CAP", "4"))
     SEARCH_CORE_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_CORE_CAP", "12"))
     SEARCH_START_TOKEN_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_START_TOKEN_CAP", "16"))
+    SEARCH_REFILL_ROUNDS: int = int(os.getenv("ALPHAMASTER_SEARCH_REFILL_ROUNDS", "2"))
     ANNEAL_TEMP: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP", "0.35"))
     ANNEAL_TEMP_MIN: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP_MIN", "0.03"))
     ANNEAL_DECAY: float = float(os.getenv("ALPHAMASTER_ANNEAL_DECAY", "0.997"))
