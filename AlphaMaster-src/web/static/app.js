@@ -1285,6 +1285,12 @@ function chartWindowTouchesLatest(total, tolerance = 2) {
   return chartZoom.max >= total - 1 - tolerance;
 }
 
+function chartWindowShowsAll(total = chartTotalPoints()) {
+  if (!Number.isFinite(total) || total <= 1) return true;
+  if (chartZoom.min == null || chartZoom.max == null) return true;
+  return chartZoom.min <= 0 && chartZoom.max >= total - 1;
+}
+
 function followLatestChartWindow(total, spanOverride = null) {
   if (!Number.isFinite(total) || total <= 0) {
     chartZoom = { min: null, max: null };
@@ -1385,12 +1391,20 @@ function installChartZoomHandlers() {
 
 function updateChartInPlace(steps, history) {
   const prevLen = chartFullSteps.length;
+  const wasShowingAll = chartWindowShowsAll(prevLen);
   const followSpan = chartFollowSpan;
   chartFullSteps = steps;
   chartFullHistory = history;
 
   const grew = steps.length > prevLen;
-  if (chartAutoFollow && grew) followLatestChartWindow(steps.length, followSpan);
+  if (chartAutoFollow && grew) {
+    if (wasShowingAll) {
+      chartZoom = { min: null, max: null };
+      chartFollowSpan = Math.max(2, steps.length - 1);
+    } else {
+      followLatestChartWindow(steps.length, followSpan);
+    }
+  }
   applyChartZoom("none");
 }
 
