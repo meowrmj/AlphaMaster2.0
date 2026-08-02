@@ -124,6 +124,10 @@ class ModelConfig:
     INCUBATION_REPLAY_STEPS: int = 260
     INCUBATION_REPLAY_FRAC: float = 0.08
     INCUBATION_MIN_SCORE: float = -0.5
+    ELITE_GENETIC_REPLAY_FRAC: float = float(os.getenv("ALPHAMASTER_ELITE_GENETIC_REPLAY_FRAC", "0.35"))
+    ELITE_GENETIC_MUTATION_RATE: float = float(os.getenv("ALPHAMASTER_ELITE_GENETIC_MUTATION_RATE", "0.35"))
+    ELITE_GENETIC_CROSSOVER_RATE: float = float(os.getenv("ALPHAMASTER_ELITE_GENETIC_CROSSOVER_RATE", "0.70"))
+    ELITE_GENETIC_TOURNAMENT_K: int = int(os.getenv("ALPHAMASTER_ELITE_GENETIC_TOURNAMENT_K", "4"))
 
     # Optional search plugins. They propose extra formulas for evaluation, but
     # V1 keeps them out of REINFORCE gradients so they do not pull the generator.

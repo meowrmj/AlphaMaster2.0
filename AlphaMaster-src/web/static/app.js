@@ -56,6 +56,10 @@ const EVAL_MODE_LABELS = {
 
 const REPLAY_POLICY_LABELS = {
   qd_incubation: "QD + 新方向孵化",
+  qd_incubation_elite_genetic: "QD + 新方向孵化 + 精英遗传",
+  qd_elite_genetic: "QD 优秀池 + 精英遗传",
+  incubation_elite_genetic: "新方向孵化 + 精英遗传",
+  elite_genetic: "精英遗传",
   qd: "QD 优秀池",
   incubation: "新方向孵化",
   none: "关闭回放",
@@ -64,6 +68,7 @@ const REPLAY_POLICY_LABELS = {
 const REPLAY_MODULES = [
   { key: "qd", label: "QD 优秀池" },
   { key: "incubation", label: "新方向孵化" },
+  { key: "elite_genetic", label: "精英遗传" },
 ];
 
 const REPLAY_PAGE_LABELS = ["回放记忆", "搜索增强"];
@@ -112,7 +117,7 @@ function syncEvalOptionsForAlgorithm() {
 
 function scopedReplayConfigForAlgorithm() {
   if (getAlgorithmMode() === "ga") {
-    return normalizeReplayConfig({ modules: { qd: false, incubation: false } });
+    return normalizeReplayConfig({ modules: { qd: false, incubation: false, elite_genetic: false } });
   }
   return getReplayConfig();
 }
@@ -183,17 +188,21 @@ function evalModeLabel(mode) {
 function replayModulesFromLegacy(policy) {
   const value = String(policy || "qd_incubation").toLowerCase();
   return {
-    qd: value === "qd_incubation" || value === "qd",
-    incubation: value === "qd_incubation" || value === "incubation",
+    qd: value.includes("qd"),
+    incubation: value.includes("incubation"),
+    elite_genetic: value.includes("elite_genetic"),
   };
 }
 
 function replayPolicyFromModules(modules) {
   const qd = Boolean(modules?.qd);
   const incubation = Boolean(modules?.incubation);
-  if (qd && incubation) return "qd_incubation";
-  if (qd) return "qd";
-  if (incubation) return "incubation";
+  const eliteGenetic = Boolean(modules?.elite_genetic);
+  const parts = [];
+  if (qd) parts.push("qd");
+  if (incubation) parts.push("incubation");
+  if (eliteGenetic) parts.push("elite_genetic");
+  if (parts.length) return parts.join("_");
   return "none";
 }
 
@@ -1894,7 +1903,7 @@ function restoreControlsFromTrainingJob(job) {
   replayPolicyDraftDirty = false;
   const alg = job.algorithm_mode || "rl";
   const mode = job.eval_mode || "cpu_batch";
-  const replay = normalizeReplayConfig(job.replay_config || { modules: { qd: true, incubation: true } });
+  const replay = normalizeReplayConfig(job.replay_config || { modules: { qd: true, incubation: true, elite_genetic: false } });
   const search = normalizeSearchConfig(job.search_config || { modules: { annealing: false, genetic: false } });
   const algSelect = $("algorithmModeSelect");
   const evalSelect = $("evalModeSelect");
@@ -1931,7 +1940,7 @@ function syncRunningTrainingControls(job) {
     evalMode = getEvalMode();
     localStorage.setItem("alphamaster_eval_mode", evalMode);
   }
-  const replay = normalizeReplayConfig(job.replay_config || job.replay_policy || { modules: { qd: true, incubation: true } });
+  const replay = normalizeReplayConfig(job.replay_config || job.replay_policy || { modules: { qd: true, incubation: true, elite_genetic: false } });
   const search = normalizeSearchConfig(job.search_config || { modules: { annealing: false, genetic: false } });
   replayConfig = replay;
   replayPolicy = replayPolicyFromModules(replay.modules);

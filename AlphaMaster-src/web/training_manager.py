@@ -28,8 +28,17 @@ JOB_STATE_PATH = LOG_DIR / "training_job_state.json"
 
 EVAL_MODES = {"cpu_batch", "cuda_batch", "legacy_cpu"}
 ALGORITHM_MODES = {"rl", "ga", "hybrid"}
-REPLAY_MODULES = {"qd", "incubation"}
-REPLAY_POLICIES = {"qd_incubation", "qd", "incubation", "none"}
+REPLAY_MODULES = {"qd", "incubation", "elite_genetic"}
+REPLAY_POLICIES = {
+    "qd_incubation",
+    "qd",
+    "incubation",
+    "qd_incubation_elite_genetic",
+    "qd_elite_genetic",
+    "incubation_elite_genetic",
+    "elite_genetic",
+    "none",
+}
 SEARCH_MODULES = {"annealing", "genetic"}
 VCVARS64_BAT = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
 CUDA_HOME = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
@@ -92,20 +101,25 @@ def _normalize_algorithm_mode(value: str | None) -> str:
 def _legacy_replay_modules(value: str | None) -> dict[str, bool]:
     policy = str(value or "qd_incubation").strip().lower()
     return {
-        "qd": policy in {"qd_incubation", "qd", "hybrid"},
-        "incubation": policy in {"qd_incubation", "incubation", "hybrid"},
+        "qd": "qd" in policy or policy == "hybrid",
+        "incubation": "incubation" in policy or policy == "hybrid",
+        "elite_genetic": "elite_genetic" in policy,
     }
 
 
 def _replay_policy_name(modules: dict[str, bool]) -> str:
     qd = bool(modules.get("qd"))
     incubation = bool(modules.get("incubation"))
-    if qd and incubation:
-        return "qd_incubation"
+    elite_genetic = bool(modules.get("elite_genetic"))
+    parts: list[str] = []
     if qd:
-        return "qd"
+        parts.append("qd")
     if incubation:
-        return "incubation"
+        parts.append("incubation")
+    if elite_genetic:
+        parts.append("elite_genetic")
+    if parts:
+        return "_".join(parts)
     return "none"
 
 
@@ -114,7 +128,7 @@ def _normalize_replay_config(value: Any | None) -> tuple[str, dict[str, Any]]:
         raw_modules = value.get("modules")
         if isinstance(raw_modules, dict):
             modules = {
-                key: bool(raw_modules.get(key, True))
+                key: bool(raw_modules.get(key, key in {"qd", "incubation"}))
                 for key in REPLAY_MODULES
             }
         else:
