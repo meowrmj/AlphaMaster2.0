@@ -4,6 +4,7 @@ const CHART_LOD_FULL_POINTS = 1200;
 const CHART_LOD_MEDIUM_POINTS = 1200;
 const CHART_LOD_LARGE_POINTS = 800;
 const CHART_LOD_EXTREME_POINTS = 520;
+const CHART_SMOOTH_UPDATE_POINTS = 900;
 let selectedDataFile = null;
 let selectedSymbol = null;
 let dataRootDir = "";
@@ -943,7 +944,7 @@ const CHART_OPTIONS = {
   normalized: true,
   interaction: { mode: "index", intersect: false },
   events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : ["click"],
-  animation: { duration: 450, easing: "easeOutQuart" },
+  animation: { duration: 220, easing: "easeOutCubic" },
   transitions: {
     active: { animation: { duration: 0 } },
   },
@@ -1139,7 +1140,7 @@ function getVisibleChartData() {
 }
 
 function syncVisibleChartData() {
-  if (!chart || !chartFullSteps.length) return;
+  if (!chart || !chartFullSteps.length) return null;
   const visible = getVisibleChartData();
   chart.data.labels = visible.steps;
   const next = buildChartDatasets(visible.history, visible);
@@ -1153,6 +1154,7 @@ function syncVisibleChartData() {
   }
   const nextLabels = new Set(next.map((d) => d.label));
   chart.data.datasets = chart.data.datasets.filter((d) => nextLabels.has(d.label));
+  return visible;
 }
 
 function updateChartTooltipMode() {
@@ -1239,11 +1241,17 @@ function clampChartWindow(min, max, total) {
 
 function applyChartZoom(mode = "none") {
   if (!chart) return;
-  syncVisibleChartData();
+  const visible = syncVisibleChartData();
   const x = chart.options.scales.x;
   delete x.min;
   delete x.max;
-  chart.update(mode);
+  if (mode === "smooth" && visible && !visible.simplified && visible.renderedCount <= CHART_SMOOTH_UPDATE_POINTS) {
+    chart.update();
+  } else if (mode === "smooth") {
+    chart.update("none");
+  } else {
+    chart.update(mode);
+  }
 }
 
 function resetChartZoom() {
@@ -1397,6 +1405,7 @@ function updateChartInPlace(steps, history) {
   chartFullHistory = history;
 
   const grew = steps.length > prevLen;
+  let updateMode = "none";
   if (chartAutoFollow && grew) {
     if (wasShowingAll) {
       chartZoom = { min: null, max: null };
@@ -1404,8 +1413,9 @@ function updateChartInPlace(steps, history) {
     } else {
       followLatestChartWindow(steps.length, followSpan);
     }
+    updateMode = "smooth";
   }
-  applyChartZoom("none");
+  applyChartZoom(updateMode);
 }
 
 function renderChart(history, label, progress) {
