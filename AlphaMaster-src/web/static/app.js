@@ -938,7 +938,7 @@ const CHART_OPTIONS = {
   maintainAspectRatio: false,
   normalized: true,
   interaction: { mode: "index", intersect: false },
-  events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : ["click"],
+  events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : [],
   animation: { duration: 450, easing: "easeOutQuart" },
   transitions: {
     active: { animation: { duration: 450, easing: "easeOutQuart" } },
@@ -1088,7 +1088,7 @@ function updateChartTooltipMode() {
   if (!chart) return;
   chart.options.events = chartTooltipPersistent
     ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"]
-    : ["click"];
+    : [];
   if (!chartTooltipPersistent) {
     chart.setActiveElements([]);
     chart.tooltip?.setActiveElements([], { x: 0, y: 0 });
