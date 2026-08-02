@@ -937,7 +937,6 @@ const CHART_OPTIONS = {
   responsive: true,
   maintainAspectRatio: false,
   normalized: true,
-  parsing: false,
   interaction: { mode: "index", intersect: false },
   events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : ["click"],
   animation: { duration: 450, easing: "easeOutQuart" },
