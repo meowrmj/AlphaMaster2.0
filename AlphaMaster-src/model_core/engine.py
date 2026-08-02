@@ -205,6 +205,31 @@ class ConstrainedSampler:
             if cfg[0] in SIGN_RESTORE_OPS:
                 self.sign_restore_ids.add(tid)
         self._valid_mask_cache: dict[tuple[str, int, int, int, int | None, int], torch.Tensor] = {}
+        self._constraint_tensor_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def _constraint_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = str(device)
+        cached = self._constraint_tensor_cache.get(key)
+        if cached is not None:
+            return cached
+        delta = torch.tensor(
+            [self.delta[tid] for tid in range(self.vocab_size)],
+            dtype=torch.long,
+            device=device,
+        )
+        infected = torch.tensor(
+            [tid in self.infected_propagating_ids for tid in range(self.vocab_size)],
+            dtype=torch.bool,
+            device=device,
+        )
+        positive = torch.tensor(
+            [tid in self.positive_only_ids for tid in range(self.vocab_size)],
+            dtype=torch.bool,
+            device=device,
+        )
+        cached = (delta, infected, positive)
+        self._constraint_tensor_cache[key] = cached
+        return cached
 
     def valid_mask(self, stack_depth: int, step_idx: int,
                    total_steps: int, device: torch.device,
@@ -241,19 +266,32 @@ class ConstrainedSampler:
                               step_idx: int, total_steps: int,
                               prev_tokens: list[int | None] | None = None,
         infected_chain_lens: list[int] | None = None) -> torch.Tensor:
-        masked = logits.clone()
         device = logits.device
-        for b, depth in enumerate(stack_depths):
-            prev_t = prev_tokens[b] if prev_tokens else None
-            icl = infected_chain_lens[b] if infected_chain_lens else 0
-            key = (str(device), int(depth), int(step_idx), int(total_steps), prev_t, int(icl))
-            vmask = self._valid_mask_cache.get(key)
-            if vmask is None:
-                vmask = self.valid_mask(depth, step_idx, total_steps, device,
-                                        prev_token=prev_t, infected_chain_len=icl)
-                self._valid_mask_cache[key] = vmask
-            masked[b][~vmask] = -1e9
-        return masked
+        if logits.shape[0] == 0:
+            return logits
+        delta, infected, positive = self._constraint_tensors(device)
+        depths = torch.tensor(stack_depths, dtype=torch.long, device=device).view(-1, 1)
+        remaining = total_steps - step_idx
+        new_depth = depths + delta.view(1, -1)
+        mask = new_depth >= 1
+        min_future = new_depth + (remaining - 1) * (-2)
+        max_future = new_depth + (remaining - 1)
+        mask = mask & (min_future <= 1) & (max_future >= 1)
+
+        if infected_chain_lens:
+            infected_lens = torch.tensor(
+                infected_chain_lens,
+                dtype=torch.long,
+                device=device,
+            ).view(-1, 1)
+            infected_row = infected.view(1, -1)
+            mask = mask & ~((infected_lens >= 2) & infected_row)
+            mask = mask & ~((infected_lens >= 3) & (infected_row | positive.view(1, -1)))
+
+        empty_rows = ~mask.any(dim=1)
+        if bool(empty_rows.any()):
+            mask[empty_rows] = (depths[empty_rows] + delta.view(1, -1)) >= 1
+        return logits.masked_fill(~mask, -1e9)
 
     def update_infection(self, token: int, infected_chain_len: int) -> int:
         """更新感染链长度，返回新的感染链长度。"""
@@ -1231,8 +1269,8 @@ class AlphaEngine:
                         tok_new.append(a)
                         ent_new.append(ent)
                         inp_new_full[:, si + 1] = a
-                        for b in range(n_policy):
-                            tok_id = a[b].item()
+                        sampled_tokens = a.detach().tolist()
+                        for b, tok_id in enumerate(sampled_tokens):
                             sd_new[b] += self.sampler.delta[tok_id]
                             prev_tokens_new[b] = tok_id
                             infected_chain_new[b] = self.sampler.update_infection(
@@ -1253,8 +1291,8 @@ class AlphaEngine:
                         lp_elite.append(lp_e)
                         ent_elite.append(ent_e)
                         inp_e_full[:, si + 1] = tk
-                        for b in range(n_memory):
-                            tok_id = tk[b].item()
+                        memory_tokens = tk.detach().tolist()
+                        for b, tok_id in enumerate(memory_tokens):
                             sd_e[b] += self.sampler.delta[tok_id]
                             prev_tokens_elite[b] = tok_id
                             infected_chain_elite[b] = self.sampler.update_infection(
