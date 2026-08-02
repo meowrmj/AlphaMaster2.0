@@ -20,6 +20,9 @@ let chartDrag = null;
 let chartAutoFollow = true;
 let chartZoomHandlersReady = false;
 let chartFollowSpan = DEFAULT_CHART_WINDOW - 1;
+let chartFullSteps = [];
+let chartFullHistory = null;
+let chartTooltipPersistent = localStorage.getItem("alphamaster_chart_tooltip_persistent") !== "0";
 let trainingStartPending = false;
 let trainingPendingAction = null;
 let trainingRequestInFlight = false;
@@ -933,7 +936,10 @@ if (window.Chart) Chart.register(glowPlugin);
 const CHART_OPTIONS = {
   responsive: true,
   maintainAspectRatio: false,
+  normalized: true,
+  parsing: false,
   interaction: { mode: "index", intersect: false },
+  events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : ["click"],
   animation: { duration: 450, easing: "easeOutQuart" },
   transitions: {
     active: { animation: { duration: 450, easing: "easeOutQuart" } },
@@ -1018,6 +1024,8 @@ function destroyChart() {
   chartZoom = { min: null, max: null };
   chartAutoFollow = true;
   chartFollowSpan = DEFAULT_CHART_WINDOW - 1;
+  chartFullSteps = [];
+  chartFullHistory = null;
 }
 
 function createChart(ctx, steps, history) {
@@ -1025,6 +1033,78 @@ function createChart(ctx, steps, history) {
     type: "line",
     data: { labels: steps, datasets: buildChartDatasets(history) },
     options: CHART_OPTIONS,
+  });
+}
+
+function chartTotalPoints() {
+  return chartFullSteps.length || chart?.data?.labels?.length || 0;
+}
+
+function visibleChartBounds(total = chartTotalPoints()) {
+  if (!Number.isFinite(total) || total <= 0) return { start: 0, end: 0 };
+  if (chartZoom.min == null || chartZoom.max == null) return { start: 0, end: total };
+  const start = Math.max(0, Math.min(total - 1, chartZoom.min));
+  const end = Math.max(start + 1, Math.min(total, chartZoom.max + 1));
+  return { start, end };
+}
+
+function sliceChartHistory(history, start, end, fullLen) {
+  const sliced = {};
+  if (!history || typeof history !== "object") return sliced;
+  for (const [key, value] of Object.entries(history)) {
+    sliced[key] = Array.isArray(value) && value.length === fullLen ? value.slice(start, end) : value;
+  }
+  return sliced;
+}
+
+function getVisibleChartData() {
+  const total = chartTotalPoints();
+  const { start, end } = visibleChartBounds(total);
+  return {
+    steps: chartFullSteps.slice(start, end),
+    history: sliceChartHistory(chartFullHistory, start, end, total),
+  };
+}
+
+function syncVisibleChartData() {
+  if (!chart || !chartFullSteps.length) return;
+  const visible = getVisibleChartData();
+  chart.data.labels = visible.steps;
+  const next = buildChartDatasets(visible.history);
+  for (const ds of next) {
+    const existing = chart.data.datasets.find((d) => d.label === ds.label);
+    if (existing) {
+      existing.data = ds.data;
+    } else {
+      chart.data.datasets.push(ds);
+    }
+  }
+  const nextLabels = new Set(next.map((d) => d.label));
+  chart.data.datasets = chart.data.datasets.filter((d) => nextLabels.has(d.label));
+}
+
+function updateChartTooltipMode() {
+  const toggle = $("chartTooltipToggle");
+  if (toggle) toggle.checked = chartTooltipPersistent;
+  if (!chart) return;
+  chart.options.events = chartTooltipPersistent
+    ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"]
+    : ["click"];
+  if (!chartTooltipPersistent) {
+    chart.setActiveElements([]);
+    chart.tooltip?.setActiveElements([], { x: 0, y: 0 });
+  }
+  chart.update("none");
+}
+
+function initChartTooltipToggle() {
+  const toggle = $("chartTooltipToggle");
+  if (!toggle) return;
+  toggle.checked = chartTooltipPersistent;
+  toggle.addEventListener("change", (event) => {
+    chartTooltipPersistent = event.target.checked;
+    localStorage.setItem("alphamaster_chart_tooltip_persistent", chartTooltipPersistent ? "1" : "0");
+    updateChartTooltipMode();
   });
 }
 
@@ -1086,14 +1166,10 @@ function clampChartWindow(min, max, total) {
 
 function applyChartZoom(mode = "none") {
   if (!chart) return;
+  syncVisibleChartData();
   const x = chart.options.scales.x;
-  if (chartZoom.min == null || chartZoom.max == null) {
-    delete x.min;
-    delete x.max;
-  } else {
-    x.min = chartZoom.min;
-    x.max = chartZoom.max;
-  }
+  delete x.min;
+  delete x.max;
   chart.update(mode);
 }
 
@@ -1158,13 +1234,13 @@ function followLatestChartWindow(total, spanOverride = null) {
 
 function resetChartToLatest() {
   chartAutoFollow = true;
-  followLatestChartWindow(chart?.data?.labels?.length || 0);
+  followLatestChartWindow(chartTotalPoints());
   applyChartZoom("active");
 }
 
 function zoomChartAt(canvasX, factor) {
   if (!chart) return;
-  const total = chart.data.labels.length;
+  const total = chartTotalPoints();
   if (total < 3) return;
   const area = chart.chartArea;
   if (!area || canvasX < area.left || canvasX > area.right) return;
@@ -1188,7 +1264,7 @@ function zoomChartAt(canvasX, factor) {
 
 function panChartByPixels(deltaX) {
   if (!chart || !chartDrag) return;
-  const total = chart.data.labels.length;
+  const total = chartTotalPoints();
   const area = chart.chartArea;
   if (!area || total < 3) return;
   const span = chartDrag.max - chartDrag.min;
@@ -1213,7 +1289,7 @@ function installChartZoomHandlers() {
   }, { passive: false });
   canvas.addEventListener("pointerdown", (event) => {
     if (!chart || event.button !== 0) return;
-    const total = chart.data.labels.length;
+    const total = chartTotalPoints();
     chartDrag = {
       startX: event.clientX,
       min: chartZoom.min ?? 0,
@@ -1235,26 +1311,14 @@ function installChartZoomHandlers() {
 }
 
 function updateChartInPlace(steps, history) {
-  const prevLen = chart.data.labels.length;
+  const prevLen = chartFullSteps.length;
   const followSpan = chartAutoFollow ? rememberChartFollowSpan(prevLen || steps.length) : chartFollowSpan;
-  chart.data.labels = steps;
-
-  const next = buildChartDatasets(history);
-  for (const ds of next) {
-    const existing = chart.data.datasets.find((d) => d.label === ds.label);
-    if (existing) {
-      existing.data = ds.data;
-    } else {
-      chart.data.datasets.push(ds);
-    }
-  }
-
-  const nextLabels = new Set(next.map((d) => d.label));
-  chart.data.datasets = chart.data.datasets.filter((d) => nextLabels.has(d.label));
+  chartFullSteps = steps;
+  chartFullHistory = history;
 
   const grew = steps.length > prevLen;
   if (chartAutoFollow && grew) followLatestChartWindow(steps.length, followSpan);
-  applyChartZoom(grew ? "active" : "none");
+  applyChartZoom("none");
 }
 
 function renderChart(history, label, progress) {
@@ -1278,10 +1342,14 @@ function renderChart(history, label, progress) {
     renderTimingSummary(history);
   } else {
     destroyChart();
+    chartFullSteps = steps;
+    chartFullHistory = history;
     chartAutoFollow = true;
     followLatestChartWindow(steps.length);
-    chart = createChart(ctx, steps, history);
+    const visible = getVisibleChartData();
+    chart = createChart(ctx, visible.steps, visible.history);
     chartSymbol = label;
+    updateChartTooltipMode();
     applyChartZoom("none");
     renderTimingSummary(history);
   }
@@ -3684,6 +3752,7 @@ async function init() {
     await logClientError("初始化失败: " + e.message);
   }
   initEvalModeSelect();
+  initChartTooltipToggle();
   await refreshOverview();
   $("browseBtn").addEventListener("click", browseDataFile);
   if ($("dataRootBrowseBtn")) $("dataRootBrowseBtn").addEventListener("click", browseDataRootDir);

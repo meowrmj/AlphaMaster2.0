@@ -368,6 +368,45 @@ body {
   font-family: var(--mono);
 }
 
+.chart-head-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.chart-head-tools .hint {
+  min-width: 0;
+  text-align: right;
+}
+
+.chart-tooltip-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  cursor: pointer;
+  background: rgba(9, 14, 24, 0.55);
+}
+
+.chart-tooltip-switch:hover {
+  border-color: var(--border-hover);
+  color: var(--text);
+}
+
+.chart-tooltip-switch input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
 /* ============================== 表单 ============================== */
 .launch-form {
   display: flex;

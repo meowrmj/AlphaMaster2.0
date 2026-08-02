@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=43" />
+  <link rel="stylesheet" href="/static/style.css?v=44" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -181,7 +181,13 @@
         <span class="hud-corner bl"></span><span class="hud-corner br"></span>
         <div class="panel-head">
           <h2 id="chartTitle">训练曲线</h2>
-          <span class="hint" id="chartHint">选择文件并开始训练后显示</span>
+          <div class="chart-head-tools">
+            <span class="hint" id="chartHint">选择文件并开始训练后显示</span>
+            <label class="chart-tooltip-switch" title="关闭后只在点击图表时显示提示框">
+              <input type="checkbox" id="chartTooltipToggle" checked>
+              <span>悬浮提示</span>
+            </label>
+          </div>
         </div>
         <div class="chart-wrap">
           <canvas id="mainChart"></canvas>
@@ -711,6 +717,6 @@
   </div>
 
   <script src="/static/bg.js?v=1"></script>
-  <script src="/static/app.js?v=112"></script>
+  <script src="/static/app.js?v=113"></script>
 </body>
 </html>
