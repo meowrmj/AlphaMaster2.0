@@ -317,15 +317,8 @@ def get_symbol_progress(
             current_step = max(current_step, _step_from_name(latest))
             break
 
-    if strategy:
-        if strategy.get("best_score") is not None:
-            strategy_score = float(strategy["best_score"])
-            if best_score is None or strategy_score > float(best_score):
-                best_score = strategy_score
-                if strategy.get("formula"):
-                    best_formula = strategy["formula"]
-        if best_formula is None and strategy.get("formula"):
-            best_formula = strategy["formula"]
+    if strategy and best_formula is None and strategy.get("formula"):
+        best_formula = strategy["formula"]
 
     return SymbolProgress(
         symbol=symbol,

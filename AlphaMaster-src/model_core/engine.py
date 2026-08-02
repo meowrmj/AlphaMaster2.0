@@ -34,7 +34,7 @@ from .backtest import MT5Backtest, estimate_periods_per_year
 from .vocab import FORMULA_VOCAB, VOCAB_VERSION, VocabVersionMismatchError  # task 12.2
 from .replay_policies import build_replay_policy, formula_bucket_key
 from .search_plugins import SearchPluginManager
-from .behavior_dedup import behavior_vector_from_factor, behavior_vectors_from_factors
+from .behavior_dedup import behavior_vector_from_factor, behavior_vectors_from_factors, formula_key
 from .training_control import acknowledge_checkpoint_stop, read_checkpoint_stop_request
 
 # P3：冠军在场时间稳健性校验所需
@@ -1559,12 +1559,6 @@ class AlphaEngine:
 
             rewards = torch.tensor(reward_values, dtype=torch.float32, device=ModelConfig.DEVICE)
             val_scores = torch.tensor(val_score_values, dtype=torch.float32, device=ModelConfig.DEVICE)
-            self.replay_policy.observe_many(
-                replay_observations,
-                step=step,
-                last_restart_step=self._last_restart_step,
-            )
-
             plugin_results = [
                 results[i] for i, origin in enumerate(formula_origins)
                 if origin in {"annealing", "genetic"}
@@ -1573,7 +1567,31 @@ class AlphaEngine:
                 origin for origin in formula_origins
                 if origin in {"annealing", "genetic"}
             ]
-            self.search_plugins.observe(step=step, results=plugin_results, origins=plugin_result_origins)
+            search_observe_info = self.search_plugins.observe(
+                step=step,
+                results=plugin_results,
+                origins=plugin_result_origins,
+            )
+            accepted_plugin_formulas = {
+                formula_key(formula)
+                for formula in search_observe_info.get("accepted_formulas", [])
+            }
+            if accepted_plugin_formulas:
+                replay_observations = [
+                    item for item in replay_observations
+                    if item.get("origin") not in {"annealing", "genetic"}
+                    or formula_key(item.get("formula") or []) in accepted_plugin_formulas
+                ]
+            else:
+                replay_observations = [
+                    item for item in replay_observations
+                    if item.get("origin") not in {"annealing", "genetic"}
+                ]
+            self.replay_policy.observe_many(
+                replay_observations,
+                step=step,
+                last_restart_step=self._last_restart_step,
+            )
 
 
             # ── Part D: REINFORCE gradient update ────────────────────
@@ -1804,6 +1822,12 @@ class AlphaEngine:
                 replay_metrics.get("behavior_memory_size", 0))
             self.training_history.setdefault('search_behavior_memory_size', []).append(
                 search_metrics.get("search_behavior_memory_size", 0))
+            self.training_history.setdefault('search_plugin_evaluated', []).append(
+                search_metrics.get("search_plugin_evaluated", 0))
+            self.training_history.setdefault('search_plugin_accepted', []).append(
+                search_metrics.get("search_plugin_accepted", 0))
+            self.training_history.setdefault('search_plugin_rejected', []).append(
+                search_metrics.get("search_plugin_rejected", 0))
             self.training_history.setdefault('anneal_accept_rate', []).append(
                 search_metrics["anneal_accept_rate"])
             self.training_history.setdefault('genetic_planned', []).append(

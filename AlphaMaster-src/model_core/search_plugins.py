@@ -63,6 +63,12 @@ class SearchPluginManager:
             "parent_source": "none",
             "operations": {},
         }
+        self._last_observe_info: dict[str, Any] = {
+            "evaluated": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "accepted_formulas": [],
+        }
         self.behavior_by_formula: dict[tuple[int, ...], list[float]] = {}
 
     @property
@@ -103,7 +109,7 @@ class SearchPluginManager:
             origins.extend([name] * len(batch))
         return SearchBatch(formulas, origins, self.metrics() | {"planned": len(formulas)})
 
-    def observe(self, *, step: int, results: list[dict], origins: list[str]) -> None:
+    def observe(self, *, step: int, results: list[dict], origins: list[str]) -> dict[str, Any]:
         archive_entries: list[ReplayEntry] = []
         for r, origin in zip(results, origins):
             if not origin:
@@ -122,10 +128,19 @@ class SearchPluginManager:
             self.counter += 1
             if origin == "annealing":
                 self._observe_annealing(score, formula)
+        accepted: list[ReplayEntry] = []
         if archive_entries:
             accepted = self._filter_new_by_behavior(archive_entries)
             self.archive = self._rebalance_with_behavior(self.archive + accepted)
             self._prune_behavior_memory()
+        accepted_formulas = [list(entry[2]) for entry in accepted]
+        self._last_observe_info = {
+            "evaluated": len(archive_entries),
+            "accepted": len(accepted),
+            "rejected": max(0, len(archive_entries) - len(accepted)),
+            "accepted_formulas": accepted_formulas,
+        }
+        return dict(self._last_observe_info)
 
     def metrics(self) -> dict[str, Any]:
         names = [name for name, enabled in self.modules.items() if enabled]
@@ -141,6 +156,9 @@ class SearchPluginManager:
             "genetic_parent_source": str(self._last_genetic_info.get("parent_source") or "none"),
             "genetic_operations": dict(self._last_genetic_info.get("operations") or {}),
             "search_behavior_memory_size": len(self.behavior_by_formula),
+            "search_plugin_evaluated": int(self._last_observe_info.get("evaluated") or 0),
+            "search_plugin_accepted": int(self._last_observe_info.get("accepted") or 0),
+            "search_plugin_rejected": int(self._last_observe_info.get("rejected") or 0),
         }
 
     def state_dict(self) -> dict[str, Any]:
