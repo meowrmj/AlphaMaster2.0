@@ -205,9 +205,9 @@ class ConstrainedSampler:
             if cfg[0] in SIGN_RESTORE_OPS:
                 self.sign_restore_ids.add(tid)
         self._valid_mask_cache: dict[tuple[str, int, int, int, int | None, int], torch.Tensor] = {}
-        self._constraint_tensor_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._constraint_tensor_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-    def _constraint_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _constraint_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         key = str(device)
         cached = self._constraint_tensor_cache.get(key)
         if cached is not None:
@@ -227,7 +227,12 @@ class ConstrainedSampler:
             dtype=torch.bool,
             device=device,
         )
-        cached = (delta, infected, positive)
+        restore = torch.tensor(
+            [tid in self.sign_restore_ids for tid in range(self.vocab_size)],
+            dtype=torch.bool,
+            device=device,
+        )
+        cached = (delta, infected, positive, restore)
         self._constraint_tensor_cache[key] = cached
         return cached
 
@@ -269,8 +274,11 @@ class ConstrainedSampler:
         device = logits.device
         if logits.shape[0] == 0:
             return logits
-        delta, infected, positive = self._constraint_tensors(device)
-        depths = torch.tensor(stack_depths, dtype=torch.long, device=device).view(-1, 1)
+        delta, infected, positive, _restore = self._constraint_tensors(device)
+        if isinstance(stack_depths, torch.Tensor):
+            depths = stack_depths.to(device=device, dtype=torch.long).view(-1, 1)
+        else:
+            depths = torch.tensor(stack_depths, dtype=torch.long, device=device).view(-1, 1)
         remaining = total_steps - step_idx
         new_depth = depths + delta.view(1, -1)
         mask = new_depth >= 1
@@ -278,12 +286,15 @@ class ConstrainedSampler:
         max_future = new_depth + (remaining - 1)
         mask = mask & (min_future <= 1) & (max_future >= 1)
 
-        if infected_chain_lens:
-            infected_lens = torch.tensor(
-                infected_chain_lens,
-                dtype=torch.long,
-                device=device,
-            ).view(-1, 1)
+        if infected_chain_lens is not None and len(infected_chain_lens) > 0:
+            if isinstance(infected_chain_lens, torch.Tensor):
+                infected_lens = infected_chain_lens.to(device=device, dtype=torch.long).view(-1, 1)
+            else:
+                infected_lens = torch.tensor(
+                    infected_chain_lens,
+                    dtype=torch.long,
+                    device=device,
+                ).view(-1, 1)
             infected_row = infected.view(1, -1)
             mask = mask & ~((infected_lens >= 2) & infected_row)
             mask = mask & ~((infected_lens >= 3) & (infected_row | positive.view(1, -1)))
@@ -1224,14 +1235,12 @@ class AlphaEngine:
             )
             lp_new, tok_new, ent_new = [], [], []
             lp_elite, ent_elite = [], []
-            sd_new = [0] * n_policy
-            prev_tokens_new: list[int | None] = [None] * n_policy
-            infected_chain_new: list[int] = [0] * n_policy
+            sd_new = torch.zeros(n_policy, dtype=torch.long, device=ModelConfig.DEVICE)
+            infected_chain_new = torch.zeros(n_policy, dtype=torch.long, device=ModelConfig.DEVICE)
             inp_e_full = None
             tok_e_t = None
-            sd_e: list[int] = []
-            prev_tokens_elite: list[int | None] = []
-            infected_chain_elite: list[int] = []
+            sd_e = torch.zeros(0, dtype=torch.long, device=ModelConfig.DEVICE)
+            infected_chain_elite = torch.zeros(0, dtype=torch.long, device=ModelConfig.DEVICE)
             if n_memory > 0:
                 inp_e_full = torch.zeros(
                     (n_memory, ModelConfig.MAX_FORMULA_LEN + 1),
@@ -1239,18 +1248,24 @@ class AlphaEngine:
                     device=ModelConfig.DEVICE,
                 )
                 tok_e_t = torch.tensor(memory_formulas, dtype=torch.long, device=ModelConfig.DEVICE)
-                sd_e = [0] * n_memory
-                prev_tokens_elite = [None] * n_memory
-                infected_chain_elite = [0] * n_memory
+                inp_e_full[:, 1:ModelConfig.MAX_FORMULA_LEN + 1] = tok_e_t
+                sd_e = torch.zeros(n_memory, dtype=torch.long, device=ModelConfig.DEVICE)
+                infected_chain_elite = torch.zeros(n_memory, dtype=torch.long, device=ModelConfig.DEVICE)
 
             if n_policy > 0 or n_memory > 0:
+                n_ab = n_policy + n_memory
+                inp_ab_full = torch.zeros(
+                    (n_ab, ModelConfig.MAX_FORMULA_LEN + 1),
+                    dtype=torch.long,
+                    device=ModelConfig.DEVICE,
+                )
+                if n_memory > 0 and tok_e_t is not None:
+                    inp_ab_full[n_policy:, 1:ModelConfig.MAX_FORMULA_LEN + 1] = tok_e_t
+                delta_t, infected_t, positive_t, restore_t = self.sampler._constraint_tensors(ModelConfig.DEVICE)
                 for si in range(ModelConfig.MAX_FORMULA_LEN):
-                    chunks = []
                     if n_policy > 0:
-                        chunks.append(inp_new_full[:, :si + 1].clone())
-                    if n_memory > 0 and inp_e_full is not None:
-                        chunks.append(inp_e_full[:, :si + 1].clone())
-                    inp_ab = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                        inp_ab_full[:n_policy, :si + 1] = inp_new_full[:, :si + 1]
+                    inp_ab = inp_ab_full[:, :si + 1].clone()
                     timing_ab_forward0 = time.perf_counter()
                     lg_ab, _, _ = self.model(inp_ab)
                     timing_ab_forward_ms += (time.perf_counter() - timing_ab_forward0) * 1000.0
@@ -1261,7 +1276,6 @@ class AlphaEngine:
                             sd_new,
                             si,
                             ModelConfig.MAX_FORMULA_LEN,
-                            prev_tokens=prev_tokens_new,
                             infected_chain_lens=infected_chain_new,
                         )
                         a, lp, ent = _categorical_stats_from_logits(lg_new)
@@ -1269,12 +1283,23 @@ class AlphaEngine:
                         tok_new.append(a)
                         ent_new.append(ent)
                         inp_new_full[:, si + 1] = a
-                        sampled_tokens = a.detach().tolist()
-                        for b, tok_id in enumerate(sampled_tokens):
-                            sd_new[b] += self.sampler.delta[tok_id]
-                            prev_tokens_new[b] = tok_id
-                            infected_chain_new[b] = self.sampler.update_infection(
-                                tok_id, infected_chain_new[b])
+                        sd_new = sd_new + delta_t[a]
+                        a_positive = positive_t[a]
+                        a_restore = restore_t[a]
+                        a_infected = infected_t[a]
+                        infected_chain_new = torch.where(
+                            a_positive,
+                            infected_chain_new + 1,
+                            torch.where(
+                                a_restore,
+                                torch.zeros_like(infected_chain_new),
+                                torch.where(
+                                    a_infected & (infected_chain_new > 0),
+                                    infected_chain_new + 1,
+                                    infected_chain_new,
+                                ),
+                            ),
+                        )
                         timing_policy_dist_ms += (time.perf_counter() - timing_policy_dist0) * 1000.0
                     if n_memory > 0 and tok_e_t is not None and inp_e_full is not None:
                         timing_memory_dist0 = time.perf_counter()
@@ -1283,20 +1308,29 @@ class AlphaEngine:
                             sd_e,
                             si,
                             ModelConfig.MAX_FORMULA_LEN,
-                            prev_tokens=prev_tokens_elite,
                             infected_chain_lens=infected_chain_elite,
                         )
                         tk = tok_e_t[:, si]
                         _, lp_e, ent_e = _categorical_stats_from_logits(lg_e, tk)
                         lp_elite.append(lp_e)
                         ent_elite.append(ent_e)
-                        inp_e_full[:, si + 1] = tk
-                        memory_tokens = tk.detach().tolist()
-                        for b, tok_id in enumerate(memory_tokens):
-                            sd_e[b] += self.sampler.delta[tok_id]
-                            prev_tokens_elite[b] = tok_id
-                            infected_chain_elite[b] = self.sampler.update_infection(
-                                tok_id, infected_chain_elite[b])
+                        sd_e = sd_e + delta_t[tk]
+                        tk_positive = positive_t[tk]
+                        tk_restore = restore_t[tk]
+                        tk_infected = infected_t[tk]
+                        infected_chain_elite = torch.where(
+                            tk_positive,
+                            infected_chain_elite + 1,
+                            torch.where(
+                                tk_restore,
+                                torch.zeros_like(infected_chain_elite),
+                                torch.where(
+                                    tk_infected & (infected_chain_elite > 0),
+                                    infected_chain_elite + 1,
+                                    infected_chain_elite,
+                                ),
+                            ),
+                        )
                         timing_memory_dist_ms += (time.perf_counter() - timing_memory_dist0) * 1000.0
 
             if tok_new:
