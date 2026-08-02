@@ -25,7 +25,6 @@ except RuntimeError:
 torch.set_num_threads(_INTRA)
 
 import torch.nn.functional as F
-from torch.distributions import Categorical
 from tqdm import tqdm
 
 from .config import ModelConfig
@@ -53,6 +52,19 @@ try:
 except ImportError:
     _STRATEGY_FILE  = "best_mt5_strategy.json"
     _CHECKPOINT_DIR = pathlib.Path("checkpoints")
+
+
+def _categorical_stats_from_logits(
+    logits: torch.Tensor,
+    tokens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    if tokens is None:
+        tokens = torch.multinomial(probs, 1).squeeze(1)
+    log_prob = log_probs.gather(1, tokens[:, None]).squeeze(1)
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return tokens, log_prob, entropy
 
 
 def _safe_artifact_tag(value: str | None) -> str:
@@ -1214,11 +1226,10 @@ class AlphaEngine:
                             prev_tokens=prev_tokens_new,
                             infected_chain_lens=infected_chain_new,
                         )
-                        d = Categorical(logits=lg_new)
-                        a = d.sample()
-                        lp_new.append(d.log_prob(a))
+                        a, lp, ent = _categorical_stats_from_logits(lg_new)
+                        lp_new.append(lp)
                         tok_new.append(a)
-                        ent_new.append(d.entropy())
+                        ent_new.append(ent)
                         inp_new_full[:, si + 1] = a
                         for b in range(n_policy):
                             tok_id = a[b].item()
@@ -1237,10 +1248,10 @@ class AlphaEngine:
                             prev_tokens=prev_tokens_elite,
                             infected_chain_lens=infected_chain_elite,
                         )
-                        d_e = Categorical(logits=lg_e)
                         tk = tok_e_t[:, si]
-                        lp_elite.append(d_e.log_prob(tk))
-                        ent_elite.append(d_e.entropy())
+                        _, lp_e, ent_e = _categorical_stats_from_logits(lg_e, tk)
+                        lp_elite.append(lp_e)
+                        ent_elite.append(ent_e)
                         inp_e_full[:, si + 1] = tk
                         for b in range(n_memory):
                             tok_id = tk[b].item()
