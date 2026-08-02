@@ -640,6 +640,26 @@ __global__ void fused_binary_branch_kernel(
   out[i] = apply_branch_op(c[i], d[i], binary_v, branch_op_id);
 }
 
+template <typename scalar_t>
+__global__ void fused_unary_binary_branch_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    const scalar_t* __restrict__ c,
+    const scalar_t* __restrict__ d,
+    scalar_t* __restrict__ out,
+    int64_t n,
+    int64_t unary_op_id,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  scalar_t unary_v = apply_unary_op(a[i], unary_op_id);
+  scalar_t binary_v = apply_binary_op(b[i], unary_v, binary_op_id);
+  out[i] = apply_branch_op(c[i], d[i], binary_v, branch_op_id);
+}
+
 }  // namespace
 
 at::Tensor elementwise1_cuda(at::Tensor a, int64_t op_id) {
@@ -709,6 +729,33 @@ at::Tensor fused_binary_branch_cuda(
       d.data_ptr<float>(),
       out.data_ptr<float>(),
       n,
+      binary_op_id,
+      branch_op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor fused_unary_binary_branch_cuda(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    at::Tensor d,
+    int64_t unary_op_id,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t n = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((n + threads - 1) / threads);
+  fused_unary_binary_branch_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      c.data_ptr<float>(),
+      d.data_ptr<float>(),
+      out.data_ptr<float>(),
+      n,
+      unary_op_id,
       binary_op_id,
       branch_op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

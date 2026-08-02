@@ -48,6 +48,7 @@ class BatchStackVM3D:
         self._native_status_logged = False
         self._fused_plan_cache: dict[tuple[tuple[int, ...], ...], dict[int, list[tuple[str, str, str, Tensor]]]] = {}
         self._stage_op_plan_cache: dict[tuple[tuple[int, ...], ...], dict[int, list[tuple[int, Tensor]]]] = {}
+        self._stage_feature_plan_cache: dict[tuple[tuple[int, ...], ...], dict[int, list[tuple[int, Tensor]]]] = {}
 
     def _native(self, device: torch.device):
         enabled = os.getenv("ALPHAMASTER_NATIVE_FORMULA_OPS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -105,6 +106,19 @@ class BatchStackVM3D:
                     groups.setdefault(("shift_unary", op_name, next_op_name), []).append(row_idx)
                 elif arity == 2 and next_arity == 3 and native.supports_binary_branch(op_name, next_op_name):
                     groups.setdefault(("binary_branch", op_name, next_op_name), []).append(row_idx)
+                elif step + 2 < max_len:
+                    third_tok = row[step + 2]
+                    if third_tok < self.feat_offset or third_tok not in self.op_map:
+                        continue
+                    third_arity = self.arity_map[third_tok]
+                    third_op_name = self.op_name_map[third_tok]
+                    if (
+                        arity == 1
+                        and next_arity == 2
+                        and third_arity == 3
+                        and native.supports_unary_binary_branch(op_name, next_op_name, third_op_name)
+                    ):
+                        groups.setdefault(("unary_binary_branch", op_name, f"{next_op_name}->{third_op_name}"), []).append(row_idx)
             if groups:
                 plan[step] = [
                     (
@@ -161,6 +175,43 @@ class BatchStackVM3D:
             for step, groups in plan.items()
         }
 
+    def _build_stage_feature_plan(
+        self,
+        formulas: Tensor,
+        device: torch.device,
+    ) -> dict[int, list[tuple[int, Tensor]]]:
+        key = tuple(tuple(int(t) for t in row) for row in formulas.detach().cpu().tolist())
+        cached = self._stage_feature_plan_cache.get(key)
+        if cached is not None:
+            return {
+                step: [(feat_id, idx.to(device=device)) for feat_id, idx in groups]
+                for step, groups in cached.items()
+            }
+
+        plan: dict[int, list[tuple[int, Tensor]]] = {}
+        if not key:
+            return plan
+        max_len = len(key[0])
+        for step in range(max_len):
+            groups: dict[int, list[int]] = {}
+            for row_idx, row in enumerate(key):
+                tok = int(row[step])
+                if tok < self.feat_offset:
+                    groups.setdefault(tok, []).append(row_idx)
+            if groups:
+                plan[step] = [
+                    (feat_id, torch.tensor(indices, dtype=torch.long))
+                    for feat_id, indices in groups.items()
+                ]
+
+        if len(self._stage_feature_plan_cache) >= 64:
+            self._stage_feature_plan_cache.clear()
+        self._stage_feature_plan_cache[key] = plan
+        return {
+            step: [(feat_id, idx.to(device=device)) for feat_id, idx in groups]
+            for step, groups in plan.items()
+        }
+
     def _apply_op(self, op_name: str, op_func, args: list[Tensor], device: torch.device) -> Tensor:
         native = self._native(device)
         if native is not None and native.supports(op_name, len(args)):
@@ -212,29 +263,28 @@ class BatchStackVM3D:
         )
         ptr = torch.zeros(bsz, dtype=torch.long, device=feat_tensor.device)
         valid = torch.ones(bsz, dtype=torch.bool, device=feat_tensor.device)
-        skip_next = torch.zeros(bsz, dtype=torch.bool, device=feat_tensor.device)
+        skip_count = torch.zeros(bsz, dtype=torch.long, device=feat_tensor.device)
         feat_bank = feat_tensor.permute(1, 0, 2)
         native = self._native(feat_tensor.device)
         fused_plan = self._build_fused_plan(formulas, native, feat_tensor.device)
         stage_op_plan = self._build_stage_op_plan(formulas, feat_tensor.device)
+        stage_feature_plan = self._build_stage_feature_plan(formulas, feat_tensor.device)
 
         for step in range(max_len):
             tok = formulas[:, step]
-            stage_skip = skip_next
-            skip_next = torch.zeros_like(skip_next)
+            stage_skip = skip_count > 0
+            skip_count = torch.clamp(skip_count - 1, min=0)
             active = valid & ~stage_skip
 
-            feat_mask = active & (tok < self.feat_offset)
-            if feat_mask.any():
-                idx = torch.nonzero(feat_mask, as_tuple=False).flatten()
-                feat_ids = tok[idx]
-                ok = feat_ids < n_features
-                if ok.any():
-                    idx_ok = idx[ok]
-                    stack[idx_ok, ptr[idx_ok], :, :] = feat_bank[feat_ids[ok], :, :]
-                    ptr[idx_ok] += 1
-                if (~ok).any():
-                    valid[idx[~ok]] = False
+            for feat_id, plan_idx in stage_feature_plan.get(step, []):
+                idx = plan_idx[active[plan_idx]]
+                if idx.numel() == 0:
+                    continue
+                if feat_id < n_features:
+                    stack[idx, ptr[idx], :, :] = feat_bank[feat_id, :, :]
+                    ptr[idx] += 1
+                else:
+                    valid[idx] = False
 
             for op_tok, plan_idx in stage_op_plan.get(step, []):
                 idx = plan_idx[active[plan_idx]]
@@ -282,7 +332,7 @@ class BatchStackVM3D:
                             res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
                             stack[idx_fused, base_fused, :, :] = res
                             ptr[idx_fused] = base_fused + 1
-                            skip_next[idx_fused] = True
+                            skip_count[idx_fused] = 1
                             fused_handled[idx_fused] = True
                         elif fused_kind == "binary_branch":
                             eligible = eligible & (ptr[plan_idx] >= 4)
@@ -310,7 +360,38 @@ class BatchStackVM3D:
                             res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
                             stack[idx_fused, branch_base, :, :] = res
                             ptr[idx_fused] = branch_base + 1
-                            skip_next[idx_fused] = True
+                            skip_count[idx_fused] = 1
+                            fused_handled[idx_fused] = True
+                        elif fused_kind == "unary_binary_branch":
+                            eligible = eligible & (ptr[plan_idx] >= 4)
+                            idx_fused = plan_idx[eligible]
+                            if idx_fused.numel() == 0:
+                                continue
+                            binary_op_name, branch_op_name = next_op_name.split("->", 1)
+                            unary_base = ptr[idx_fused] - 1
+                            binary_lhs_base = ptr[idx_fused] - 2
+                            branch_base = ptr[idx_fused] - 4
+                            try:
+                                res = native.apply_unary_binary_branch(
+                                    op_name,
+                                    binary_op_name,
+                                    branch_op_name,
+                                    stack[idx_fused, unary_base, :, :],
+                                    stack[idx_fused, binary_lhs_base, :, :],
+                                    stack[idx_fused, branch_base, :, :],
+                                    stack[idx_fused, branch_base + 1, :, :],
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"native fused formula op failed: {op_name}->{binary_op_name}->{branch_op_name}"
+                                ) from exc
+                            if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                valid[idx_fused] = False
+                                continue
+                            res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                            stack[idx_fused, branch_base, :, :] = res
+                            ptr[idx_fused] = branch_base + 1
+                            skip_count[idx_fused] = 2
                             fused_handled[idx_fused] = True
 
                 if fused_handled.any():
