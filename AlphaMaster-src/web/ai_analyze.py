@@ -19,6 +19,7 @@ _SYSTEM_PROMPT = """你是量化因子挖掘与强化学习训练顾问。用户
 回答要求：
 - 必须全程使用简体中文，只允许公式 token、字段名、文件名保留英文原样；不要写英文段落、英文小标题或英文解释。
 - 只输出最终分析，不要输出“我需要先分析”“用户想问的是”“首先我思考”等推理过程或草稿。
+- 第一行必须直接写“## 1. 当前训练情况怎么样？是否值得继续”，前面不要有任何寒暄、摘要、解释或过渡句。
 - 说人话，少用术语；必须让用户能看懂当前系统到底在做什么。
 - 不要编造快照里没有的数据。
 - 结论必须先分清“训练流程是否正常”和“策略质量是否值得信任”，不要混成一句话。
@@ -125,7 +126,7 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
 
     history = progress.history or {}
     current_run_best = _current_run_best(sym, timeframe)
-    curve = _training_curve(history, max_points=500)
+    curve = _training_curve(history, max_points=240)
     history_bests = history.get("best_score") or []
     current_run_best_score = max(history_bests) if history_bests else None
     system_context = _system_context(job)
@@ -253,6 +254,7 @@ def analyze_training_stream(
 
     parts = [
         "必须用简体中文回答，只输出最终分析，不要输出推理过程、草稿或英文解释。",
+        "第一行必须直接写：## 1. 当前训练情况怎么样？是否值得继续",
         "请根据以下训练快照回答：",
         "1. 当前训练情况怎么样？是否值得继续？",
         "2. 当前插件是否真正生效？请区分回放策略、搜索增强、遗传、退火、评估加速模式。",
@@ -296,17 +298,17 @@ def analyze_training_stream(
 
     answer_parts: list[str] = []
     try:
-        for text in stream_chat_completions(resolved, messages):
+        for text in stream_chat_completions(resolved, messages, max_tokens=8192):
             answer_parts.append(text)
-            yield {"type": "delta", "text": text}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)}
         return
 
-    answer = "".join(answer_parts).strip()
+    answer = _clean_final_answer("".join(answer_parts))
     if not answer:
         yield {"type": "error", "message": "AI 返回内容为空"}
         return
+    yield {"type": "delta", "text": answer}
 
     record = {
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
@@ -361,7 +363,7 @@ def load_prior_analyses(symbol: str, timeframe: str) -> list[dict[str, Any]]:
                 "provider": row.get("provider"),
                 "model": row.get("model"),
                 "snapshot": row.get("snapshot") or {},
-                "answer": row.get("answer") or "",
+                "answer": _prior_answer_excerpt(row.get("answer") or ""),
             }
         )
     return out
@@ -376,6 +378,67 @@ def save_analysis_record(symbol: str, timeframe: str, record: dict[str, Any]) ->
     rows.append(record)
     store[key] = rows[-_MAX_HISTORY_PER_KEY:]
     HISTORY_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _clean_final_answer(text: str) -> str:
+    answer = (text or "").strip()
+    if not answer:
+        return ""
+    markers = (
+        "## 1.",
+        "## 一",
+        "## 当前训练情况",
+        "# 1.",
+    )
+    starts = [answer.find(marker) for marker in markers if answer.find(marker) >= 0]
+    if starts:
+        answer = answer[min(starts):].strip()
+    return _drop_obvious_reasoning_prefix(answer).strip()
+
+
+def _prior_answer_excerpt(text: str, limit: int = 1400) -> str:
+    raw = text or ""
+    if not any(marker in raw for marker in ("## 1.", "## 一", "## 当前训练情况", "# 1.")):
+        return "（旧分析正文格式不可靠，已忽略；请以上方历史快照字段为准。）"
+    answer = _clean_final_answer(text)
+    if len(answer) <= limit:
+        return answer
+    return answer[:limit].rstrip() + "\n（历史分析过长，已截断。）"
+
+
+def _drop_obvious_reasoning_prefix(text: str) -> str:
+    lines = (text or "").splitlines()
+    if not lines:
+        return ""
+    drop_prefixes = (
+        "用户",
+        "我们被要求",
+        "我需要",
+        "先整理",
+        "首先",
+        "Let me",
+        "I need",
+        "We need",
+        "The user",
+        "好的，用户",
+    )
+    cut = 0
+    for idx, line in enumerate(lines[:30]):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("##", "#")):
+            cut = idx
+            break
+        if any(stripped.startswith(prefix) for prefix in drop_prefixes):
+            cut = idx + 1
+            continue
+        if cut:
+            cut = idx
+            break
+    if cut:
+        return "\n".join(lines[cut:]).strip()
+    return text
 
 
 def _load_history_store() -> dict[str, Any]:
