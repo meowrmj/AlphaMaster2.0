@@ -426,6 +426,91 @@ class NativeElementwiseOps:
             NATIVE_TERNARY_OPS[branch_op_name],
         )
 
+    def supports_unary_unary_branch(self, first_unary_op_name: str, second_unary_op_name: str, branch_op_name: str) -> bool:
+        if os.getenv("ALPHAMASTER_NATIVE_FUSED_UNARY_UNARY_BRANCH", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        return (
+            first_unary_op_name in {"MAX3", "SIGMOID", "TANH_SQUASH", "SIGNED_POWER_2", "SIGNED_LOG"}
+            and first_unary_op_name in NATIVE_UNARY_OPS
+            and second_unary_op_name in {"TS_ZSCORE_10", "TS_ZSCORE_20"}
+            and second_unary_op_name in NATIVE_ROLLING_OPS
+            and branch_op_name in NATIVE_TERNARY_OPS
+            and self.supports(first_unary_op_name, 1)
+            and self.supports(second_unary_op_name, 1)
+            and self.supports(branch_op_name, 3)
+            and hasattr(self.ext, "fused_unary_unary_branch")
+        )
+
+    def apply_unary_unary_branch(
+        self,
+        first_unary_op_name: str,
+        second_unary_op_name: str,
+        branch_op_name: str,
+        unary_arg: torch.Tensor,
+        branch_condition: torch.Tensor,
+        branch_true_value: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.supports_unary_unary_branch(first_unary_op_name, second_unary_op_name, branch_op_name):
+            raise NotImplementedError(
+                f"native fused unary+unary+branch not supported: {first_unary_op_name}->{second_unary_op_name}->{branch_op_name}"
+            )
+        return self.ext.fused_unary_unary_branch(
+            unary_arg,
+            branch_condition,
+            branch_true_value,
+            NATIVE_UNARY_OPS[first_unary_op_name],
+            NATIVE_ROLLING_OPS[second_unary_op_name],
+            NATIVE_TERNARY_OPS[branch_op_name],
+        )
+
+    def supports_rolling_binary_branch(self, rolling_op_name: str, binary_op_name: str, branch_op_name: str) -> bool:
+        if os.getenv("ALPHAMASTER_NATIVE_FUSED_ROLLING_BINARY_BRANCH", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        return (
+            rolling_op_name in {"TS_MAX_10", "TS_MAX_20"}
+            and rolling_op_name in NATIVE_ROLLING_OPS
+            and binary_op_name in NATIVE_BINARY_OPS
+            and branch_op_name in NATIVE_TERNARY_OPS
+            and self.supports(rolling_op_name, 1)
+            and self.supports(binary_op_name, 2)
+            and self.supports(branch_op_name, 3)
+            and hasattr(self.ext, "fused_rolling_binary_branch")
+        )
+
+    def apply_rolling_binary_branch(
+        self,
+        rolling_op_name: str,
+        binary_op_name: str,
+        branch_op_name: str,
+        rolling_arg: torch.Tensor,
+        binary_lhs: torch.Tensor,
+        branch_condition: torch.Tensor,
+        branch_true_value: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.supports_rolling_binary_branch(rolling_op_name, binary_op_name, branch_op_name):
+            raise NotImplementedError(
+                f"native fused rolling+binary+branch not supported: {rolling_op_name}->{binary_op_name}->{branch_op_name}"
+            )
+        return self.ext.fused_rolling_binary_branch(
+            rolling_arg,
+            binary_lhs,
+            branch_condition,
+            branch_true_value,
+            NATIVE_ROLLING_OPS[rolling_op_name],
+            NATIVE_BINARY_OPS[binary_op_name],
+            NATIVE_TERNARY_OPS[branch_op_name],
+        )
+
     def apply(self, op_name: str, *args: torch.Tensor) -> torch.Tensor:
         arity = len(args)
         if arity == 1 and op_name in NATIVE_UNARY_OPS:

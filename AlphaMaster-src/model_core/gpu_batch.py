@@ -119,6 +119,20 @@ class BatchStackVM3D:
                         and native.supports_unary_binary_branch(op_name, next_op_name, third_op_name)
                     ):
                         groups.setdefault(("unary_binary_branch", op_name, f"{next_op_name}->{third_op_name}"), []).append(row_idx)
+                    if (
+                        arity == 1
+                        and next_arity == 1
+                        and third_arity == 3
+                        and native.supports_unary_unary_branch(op_name, next_op_name, third_op_name)
+                    ):
+                        groups.setdefault(("unary_unary_branch", op_name, f"{next_op_name}->{third_op_name}"), []).append(row_idx)
+                    if (
+                        arity == 1
+                        and next_arity == 2
+                        and third_arity == 3
+                        and native.supports_rolling_binary_branch(op_name, next_op_name, third_op_name)
+                    ):
+                        groups.setdefault(("rolling_binary_branch", op_name, f"{next_op_name}->{third_op_name}"), []).append(row_idx)
             if groups:
                 plan[step] = [
                     (
@@ -377,6 +391,66 @@ class BatchStackVM3D:
                                     binary_op_name,
                                     branch_op_name,
                                     stack[idx_fused, unary_base, :, :],
+                                    stack[idx_fused, binary_lhs_base, :, :],
+                                    stack[idx_fused, branch_base, :, :],
+                                    stack[idx_fused, branch_base + 1, :, :],
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"native fused formula op failed: {op_name}->{binary_op_name}->{branch_op_name}"
+                                ) from exc
+                            if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                valid[idx_fused] = False
+                                continue
+                            res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                            stack[idx_fused, branch_base, :, :] = res
+                            ptr[idx_fused] = branch_base + 1
+                            skip_count[idx_fused] = 2
+                            fused_handled[idx_fused] = True
+                        elif fused_kind == "unary_unary_branch":
+                            eligible = eligible & (ptr[plan_idx] >= 3)
+                            idx_fused = plan_idx[eligible]
+                            if idx_fused.numel() == 0:
+                                continue
+                            second_unary_op_name, branch_op_name = next_op_name.split("->", 1)
+                            unary_base = ptr[idx_fused] - 1
+                            branch_base = ptr[idx_fused] - 3
+                            try:
+                                res = native.apply_unary_unary_branch(
+                                    op_name,
+                                    second_unary_op_name,
+                                    branch_op_name,
+                                    stack[idx_fused, unary_base, :, :],
+                                    stack[idx_fused, branch_base, :, :],
+                                    stack[idx_fused, branch_base + 1, :, :],
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"native fused formula op failed: {op_name}->{second_unary_op_name}->{branch_op_name}"
+                                ) from exc
+                            if res.shape != (idx_fused.numel(), n_symbols, n_bars):
+                                valid[idx_fused] = False
+                                continue
+                            res = torch.nan_to_num(res, nan=0.0, posinf=1.0, neginf=-1.0)
+                            stack[idx_fused, branch_base, :, :] = res
+                            ptr[idx_fused] = branch_base + 1
+                            skip_count[idx_fused] = 2
+                            fused_handled[idx_fused] = True
+                        elif fused_kind == "rolling_binary_branch":
+                            eligible = eligible & (ptr[plan_idx] >= 4)
+                            idx_fused = plan_idx[eligible]
+                            if idx_fused.numel() == 0:
+                                continue
+                            binary_op_name, branch_op_name = next_op_name.split("->", 1)
+                            rolling_base = ptr[idx_fused] - 1
+                            binary_lhs_base = ptr[idx_fused] - 2
+                            branch_base = ptr[idx_fused] - 4
+                            try:
+                                res = native.apply_rolling_binary_branch(
+                                    op_name,
+                                    binary_op_name,
+                                    branch_op_name,
+                                    stack[idx_fused, rolling_base, :, :],
                                     stack[idx_fused, binary_lhs_base, :, :],
                                     stack[idx_fused, branch_base, :, :],
                                     stack[idx_fused, branch_base + 1, :, :],

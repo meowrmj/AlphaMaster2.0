@@ -206,6 +206,79 @@ __device__ __forceinline__ scalar_t value_at(
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ scalar_t apply_rolling_max_op(
+    const scalar_t* __restrict__ a,
+    int64_t flat_i,
+    int64_t t,
+    int64_t n_bars,
+    int64_t op_id) {
+  int w = op_id == OP_TS_MAX_20 ? 20 : 10;
+  int64_t base = flat_i - t;
+  scalar_t max_v = static_cast<scalar_t>(0);
+  bool first = true;
+  for (int k = 0; k < w; ++k) {
+    int64_t src_t = t - (w - 1 - k);
+    scalar_t v = value_at(a, base, src_t, n_bars);
+    if (first || v > max_v) {
+      max_v = v;
+    }
+    first = false;
+  }
+  return sanitize(max_v);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t apply_first_unary_at(
+    const scalar_t* __restrict__ a,
+    int64_t base,
+    int64_t t,
+    int64_t n_bars,
+    int64_t op_id) {
+  scalar_t cur = value_at(a, base, t, n_bars);
+  if (op_id == OP_MAX3) {
+    scalar_t d1 = value_at(a, base, t - 1, n_bars);
+    scalar_t d2 = value_at(a, base, t - 2, n_bars);
+    scalar_t out_v = cur > d1 ? cur : d1;
+    return sanitize(out_v > d2 ? out_v : d2);
+  }
+  return apply_unary_op(cur, op_id);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t apply_second_unary_window_op(
+    const scalar_t* __restrict__ a,
+    int64_t flat_i,
+    int64_t t,
+    int64_t n_bars,
+    int64_t first_unary_op_id,
+    int64_t second_unary_op_id) {
+  if (second_unary_op_id != OP_TS_ZSCORE_10 && second_unary_op_id != OP_TS_ZSCORE_20) {
+    return apply_unary_op(apply_first_unary_at(a, flat_i - t, t, n_bars, first_unary_op_id), second_unary_op_id);
+  }
+  int w = second_unary_op_id == OP_TS_ZSCORE_20 ? 20 : 10;
+  int64_t base = flat_i - t;
+  scalar_t sum = static_cast<scalar_t>(0);
+  for (int k = 0; k < w; ++k) {
+    int64_t src_t = t - (w - 1 - k);
+    sum = add_rn(sum, apply_first_unary_at(a, base, src_t, n_bars, first_unary_op_id));
+  }
+  scalar_t mean = sum / static_cast<scalar_t>(w);
+  scalar_t var = static_cast<scalar_t>(0);
+  for (int k = 0; k < w; ++k) {
+    int64_t src_t = t - (w - 1 - k);
+    scalar_t centered = apply_first_unary_at(a, base, src_t, n_bars, first_unary_op_id) - mean;
+    var = add_rn(var, mul_rn(centered, centered));
+  }
+  var = var / static_cast<scalar_t>(w);
+  scalar_t std_v = sqrtf(var > static_cast<scalar_t>(0) ? var : static_cast<scalar_t>(0));
+  if (std_v < static_cast<scalar_t>(1e-6)) {
+    return static_cast<scalar_t>(0);
+  }
+  scalar_t cur = apply_first_unary_at(a, base, t, n_bars, first_unary_op_id);
+  return sanitize((cur - mean) / (std_v + static_cast<scalar_t>(1e-6)));
+}
+
+template <typename scalar_t>
 __device__ __forceinline__ void sort_window(scalar_t* values, int n) {
   for (int i = 1; i < n; ++i) {
     scalar_t key = values[i];
@@ -660,6 +733,52 @@ __global__ void fused_unary_binary_branch_kernel(
   out[i] = apply_branch_op(c[i], d[i], binary_v, branch_op_id);
 }
 
+template <typename scalar_t>
+__global__ void fused_unary_unary_branch_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    const scalar_t* __restrict__ c,
+    scalar_t* __restrict__ out,
+    int64_t bsz,
+    int64_t n_symbols,
+    int64_t n_bars,
+    int64_t first_unary_op_id,
+    int64_t second_unary_op_id,
+    int64_t branch_op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = bsz * n_symbols * n_bars;
+  if (i >= total) {
+    return;
+  }
+  int64_t t = i % n_bars;
+  scalar_t unary_v = apply_second_unary_window_op(a, i, t, n_bars, first_unary_op_id, second_unary_op_id);
+  out[i] = apply_branch_op(b[i], c[i], unary_v, branch_op_id);
+}
+
+template <typename scalar_t>
+__global__ void fused_rolling_binary_branch_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    const scalar_t* __restrict__ c,
+    const scalar_t* __restrict__ d,
+    scalar_t* __restrict__ out,
+    int64_t bsz,
+    int64_t n_symbols,
+    int64_t n_bars,
+    int64_t rolling_op_id,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = bsz * n_symbols * n_bars;
+  if (i >= total) {
+    return;
+  }
+  int64_t t = i % n_bars;
+  scalar_t rolling_v = apply_rolling_max_op(a, i, t, n_bars, rolling_op_id);
+  scalar_t binary_v = apply_binary_op(b[i], rolling_v, binary_op_id);
+  out[i] = apply_branch_op(c[i], d[i], binary_v, branch_op_id);
+}
+
 }  // namespace
 
 at::Tensor elementwise1_cuda(at::Tensor a, int64_t op_id) {
@@ -756,6 +875,68 @@ at::Tensor fused_unary_binary_branch_cuda(
       out.data_ptr<float>(),
       n,
       unary_op_id,
+      binary_op_id,
+      branch_op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor fused_unary_unary_branch_cuda(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    int64_t first_unary_op_id,
+    int64_t second_unary_op_id,
+    int64_t branch_op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t bsz = a.size(0);
+  int64_t n_symbols = a.size(1);
+  int64_t n_bars = a.size(2);
+  int64_t total = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+  fused_unary_unary_branch_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      c.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      first_unary_op_id,
+      second_unary_op_id,
+      branch_op_id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor fused_rolling_binary_branch_cuda(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    at::Tensor d,
+    int64_t rolling_op_id,
+    int64_t binary_op_id,
+    int64_t branch_op_id) {
+  TORCH_CHECK(a.scalar_type() == at::kFloat, "native CUDA kernels currently support float32 only");
+  auto out = at::empty_like(a);
+  int64_t bsz = a.size(0);
+  int64_t n_symbols = a.size(1);
+  int64_t n_bars = a.size(2);
+  int64_t total = a.numel();
+  constexpr int threads = 256;
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+  fused_rolling_binary_branch_kernel<float><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(),
+      b.data_ptr<float>(),
+      c.data_ptr<float>(),
+      d.data_ptr<float>(),
+      out.data_ptr<float>(),
+      bsz,
+      n_symbols,
+      n_bars,
+      rolling_op_id,
       binary_op_id,
       branch_op_id);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
