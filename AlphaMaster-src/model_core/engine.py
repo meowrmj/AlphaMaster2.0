@@ -366,6 +366,8 @@ class AlphaEngine:
         self.training_history = {
             'step': [], 'avg_reward': [], 'best_score': [], 'val_score': [],
             'batch_best_val_score': [], 'new_candidate_best_val_score': [],
+            'trainable_reward_mean': [], 'trainable_reward_std': [],
+            'trainable_reward_baseline': [],
             'stable_rank': []
         }
         self._restart_count      = 0
@@ -1579,17 +1581,35 @@ class AlphaEngine:
             batch_mean = rewards.mean().item()
             timing_grad0 = time.perf_counter()
             timing_loss0 = time.perf_counter()
-            batch_std  = rewards.std().clamp(min=0.1)
+            trainable_parts = []
+            if n_policy > 0:
+                trainable_parts.append(rewards[:n_policy])
+            if n_memory > 0:
+                trainable_parts.append(rewards[n_policy + n_plugin:])
+            trainable_rewards = torch.cat(trainable_parts) if trainable_parts else rewards
+            trainable_reward_mean = trainable_rewards.mean().item()
+            trainable_reward_std = (
+                trainable_rewards.std().clamp(min=0.1)
+                if trainable_rewards.numel() > 1
+                else torch.tensor(0.1, device=ModelConfig.DEVICE)
+            )
             if ModelConfig.REWARD_EMA_BASELINE and self._reward_ema_step >= ModelConfig.REWARD_EMA_WARMUP:
                 baseline = self._reward_ema
-                adv = (rewards - baseline) / (batch_std + 1e-5)
+                trainable_baseline = float(baseline)
             else:
-                adv = (rewards - batch_mean) / (batch_std + 1e-5)
+                trainable_baseline = trainable_reward_mean
+            adv = torch.zeros_like(rewards)
+            if n_policy > 0:
+                adv[:n_policy] = (rewards[:n_policy] - trainable_baseline) / (trainable_reward_std + 1e-5)
+            if n_memory > 0:
+                adv[n_policy + n_plugin:] = (
+                    rewards[n_policy + n_plugin:] - trainable_baseline
+                ) / (trainable_reward_std + 1e-5)
             # 更新 EMA
             if self._reward_ema is None:
-                self._reward_ema = batch_mean
+                self._reward_ema = trainable_reward_mean
             else:
-                self._reward_ema = ModelConfig.REWARD_EMA_DECAY * self._reward_ema + (1.0 - ModelConfig.REWARD_EMA_DECAY) * batch_mean
+                self._reward_ema = ModelConfig.REWARD_EMA_DECAY * self._reward_ema + (1.0 - ModelConfig.REWARD_EMA_DECAY) * trainable_reward_mean
             self._reward_ema_step += 1
             adv_new   = adv[:n_policy]
             adv_elite = adv[n_policy + n_plugin:]
@@ -1737,6 +1757,11 @@ class AlphaEngine:
 
             self.training_history['step'].append(step)
             self.training_history['avg_reward'].append(avg_rew)
+            self.training_history.setdefault('trainable_reward_mean', []).append(trainable_reward_mean)
+            self.training_history.setdefault('trainable_reward_std', []).append(
+                trainable_reward_std.item() if isinstance(trainable_reward_std, torch.Tensor) else float(trainable_reward_std)
+            )
+            self.training_history.setdefault('trainable_reward_baseline', []).append(float(trainable_baseline))
             self.training_history['val_score'].append(avg_val)
             self.training_history.setdefault('batch_best_val_score', []).append(
                 step_max_val if step_max_val != -float('inf') else None
