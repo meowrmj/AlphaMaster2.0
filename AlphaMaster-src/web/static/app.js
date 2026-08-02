@@ -1385,7 +1385,7 @@ function installChartZoomHandlers() {
 
 function updateChartInPlace(steps, history) {
   const prevLen = chartFullSteps.length;
-  const followSpan = chartAutoFollow ? rememberChartFollowSpan(prevLen || steps.length) : chartFollowSpan;
+  const followSpan = chartFollowSpan;
   chartFullSteps = steps;
   chartFullHistory = history;
 
