@@ -1223,11 +1223,11 @@ select:focus { border-color: var(--accent); }
   display: block;
   width: 100% !important;
   height: 100% !important;
-  cursor: grab;
+  cursor: default;
 }
 
 .chart-wrap canvas:active {
-  cursor: grabbing;
+  cursor: default;
 }
 
 .timing-summary {
