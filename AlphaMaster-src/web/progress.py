@@ -298,19 +298,24 @@ def get_symbol_progress(
         except (json.JSONDecodeError, OSError, ValueError):
             pass
 
-    if ckpts:
-        latest = ckpts[-1]
-        ckpt_path = str(latest.relative_to(PROJECT_ROOT)).replace("\\", "/")
-        ckpt_mtime = latest.stat().st_mtime
+    for latest in reversed(ckpts):
         try:
+            latest_mtime = latest.stat().st_mtime
             meta = _load_checkpoint_meta(latest)
+            ckpt_path = str(latest.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            ckpt_mtime = latest_mtime
             current_step = max(current_step, int(meta["step"]))
             if meta.get("best_score") is not None:
                 best_score = float(meta["best_score"])
             best_formula = meta.get("best_formula")
             history = _pick_training_history(file_history, meta.get("training_history"))
+            break
+        except FileNotFoundError:
+            continue
         except Exception:
+            ckpt_path = str(latest.relative_to(PROJECT_ROOT)).replace("\\", "/")
             current_step = max(current_step, _step_from_name(latest))
+            break
 
     if strategy:
         if strategy.get("best_score") is not None:
