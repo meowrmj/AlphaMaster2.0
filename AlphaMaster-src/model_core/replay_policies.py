@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import ModelConfig
-from .elite_genetic import EliteGeneticEmitter
 from .vocab import FORMULA_VOCAB
 
 ReplayEntry = tuple[float, int, list[int], int]
@@ -24,10 +23,8 @@ class ReplayBatch:
     formulas: list[list[int]]
     n_elite: int = 0
     n_incubation: int = 0
-    n_elite_genetic: int = 0
     elite_info: dict[str, Any] | None = None
     incubation_info: dict[str, Any] | None = None
-    elite_genetic_info: dict[str, Any] | None = None
     elite_frac_effective: float = 0.0
 
     @property
@@ -82,42 +79,27 @@ class ReplayPolicy:
             "elite_archive_cells": 0,
             "incubation_pool_size": 0,
             "incubation_archive_cells": 0,
-            "elite_genetic_enabled": 0,
-            "elite_genetic_used": 0,
         }
 
 
 class QDIncubationReplayPolicy(ReplayPolicy):
     name = "qd_incubation"
 
-    def __init__(
-        self,
-        *,
-        enable_qd: bool = True,
-        enable_incubation: bool = True,
-        enable_elite_genetic: bool = False,
-        sampler=None,
-    ) -> None:
+    def __init__(self, *, enable_qd: bool = True, enable_incubation: bool = True) -> None:
         self.enable_qd = bool(enable_qd)
         self.enable_incubation = bool(enable_incubation)
-        self.enable_elite_genetic = bool(enable_elite_genetic)
-        self.elite_genetic = EliteGeneticEmitter(sampler) if sampler is not None else None
-        self.name = self._name_from_modules()
+        if self.enable_qd and self.enable_incubation:
+            self.name = "qd_incubation"
+        elif self.enable_qd:
+            self.name = "qd"
+        elif self.enable_incubation:
+            self.name = "incubation"
+        else:
+            self.name = "none"
         self.elite_pool: list[ReplayEntry] = []
         self.elite_counter = 0
         self.incubation_pool: list[ReplayEntry] = []
         self.incubation_counter = 0
-        self._last_elite_genetic_used = 0
-
-    def _name_from_modules(self) -> str:
-        active: list[str] = []
-        if self.enable_qd:
-            active.append("qd")
-        if self.enable_incubation:
-            active.append("incubation")
-        if self.enable_elite_genetic:
-            active.append("elite_genetic")
-        return "_".join(active) if active else "none"
 
     @staticmethod
     def _rebalance_elite_pool(pool: list[ReplayEntry]) -> list[ReplayEntry]:
@@ -240,39 +222,18 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             if incubation_active and self.incubation_pool
             else 0
         )
-        has_elite_source = (self.enable_qd or self.enable_elite_genetic) and self.elite_pool
-        n_elite_total = int(batch_size * elite_frac_eff) if has_elite_source else 0
-        n_elite_total = min(n_elite_total, max(0, batch_size - n_incubation))
+        n_elite = int(batch_size * elite_frac_eff) if self.enable_qd and self.elite_pool else 0
+        n_elite = min(n_elite, max(0, batch_size - n_incubation))
         incubation_formulas, incubation_info = self._sample_incubation(step, n_incubation)
         n_incubation = len(incubation_formulas)
-
-        elite_genetic_formulas: list[list[int]] = []
-        elite_genetic_info: dict[str, Any] = {"planned": 0, "produced": 0, "parents": len(self.elite_pool)}
-        if self.enable_elite_genetic and self.elite_genetic is not None and n_elite_total > 0:
-            genetic_frac = max(0.0, min(1.0, float(getattr(ModelConfig, "ELITE_GENETIC_REPLAY_FRAC", 0.35))))
-            if self.enable_qd:
-                n_elite_genetic = int(round(n_elite_total * genetic_frac))
-            else:
-                n_elite_genetic = n_elite_total
-            elite_genetic_formulas, elite_genetic_info = self.elite_genetic.propose(
-                step=step,
-                k=n_elite_genetic,
-                elite_pool=self.elite_pool,
-            )
-        n_elite_genetic = len(elite_genetic_formulas)
-
-        n_elite = max(0, n_elite_total - n_elite_genetic) if self.enable_qd else 0
         elite_formulas, elite_info = self._sample_elite(step, n_elite)
         n_elite = len(elite_formulas)
-        self._last_elite_genetic_used = n_elite_genetic
         replay = ReplayBatch(
-            formulas=incubation_formulas + elite_genetic_formulas + elite_formulas,
+            formulas=incubation_formulas + elite_formulas,
             n_elite=n_elite,
             n_incubation=n_incubation,
-            n_elite_genetic=n_elite_genetic,
             elite_info=elite_info,
             incubation_info=incubation_info,
-            elite_genetic_info=elite_genetic_info,
             elite_frac_effective=elite_frac_eff,
         )
         return batch_size - replay.n_memory, replay
@@ -280,7 +241,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
     def observe(self, *, score: float, formula: list[int], step: int, is_new: bool, last_restart_step: int) -> None:
         entry = (float(score), self.elite_counter, [int(t) for t in formula], int(step))
         self.elite_counter += 1
-        if self.enable_qd or self.enable_elite_genetic:
+        if self.enable_qd:
             self.elite_pool = self._rebalance_elite_pool(self.elite_pool + [entry])
         capture_steps = max(0, int(getattr(ModelConfig, "INCUBATION_CAPTURE_STEPS", 180)))
         if self.enable_incubation and is_new and step - last_restart_step < capture_steps:
@@ -293,7 +254,6 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             "name": self.name,
             "enable_qd": self.enable_qd,
             "enable_incubation": self.enable_incubation,
-            "enable_elite_genetic": self.enable_elite_genetic,
             "elite_pool": self.elite_pool,
             "elite_counter": self.elite_counter,
             "incubation_pool": self.incubation_pool,
@@ -301,15 +261,24 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        # Module switches come from the current training launch config. Checkpoints
-        # restore replay memory, but must not silently undo the user's selected
-        # replay modules when continuing from an older run.
-        self.name = self._name_from_modules()
-        self.elite_pool = (
-            self._rebalance_elite_pool(state.get("elite_pool") or [])
-            if (self.enable_qd or self.enable_elite_genetic)
-            else []
-        )
+        state_name = str(state.get("name") or self.name).strip().lower()
+        if "enable_qd" in state:
+            self.enable_qd = bool(state.get("enable_qd"))
+        else:
+            self.enable_qd = state_name in {"qd", "qd_incubation", "hybrid"}
+        if "enable_incubation" in state:
+            self.enable_incubation = bool(state.get("enable_incubation"))
+        else:
+            self.enable_incubation = state_name in {"incubation", "qd_incubation", "hybrid"}
+        if self.enable_qd and self.enable_incubation:
+            self.name = "qd_incubation"
+        elif self.enable_qd:
+            self.name = "qd"
+        elif self.enable_incubation:
+            self.name = "incubation"
+        else:
+            self.name = "none"
+        self.elite_pool = self._rebalance_elite_pool(state.get("elite_pool") or []) if self.enable_qd else []
         self.elite_counter = int(state.get("elite_counter") or 0)
         incubation = state.get("incubation_pool") or []
         restore_step = max((int(entry[3]) for entry in incubation), default=0)
@@ -322,8 +291,6 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             "elite_archive_cells": len({formula_bucket_key(toks) for _sc, _cnt, toks, _birth in self.elite_pool}),
             "incubation_pool_size": len(self.incubation_pool),
             "incubation_archive_cells": len({formula_bucket_key(toks) for _sc, _cnt, toks, _birth in self.incubation_pool}),
-            "elite_genetic_enabled": int(self.enable_elite_genetic),
-            "elite_genetic_used": int(self._last_elite_genetic_used),
         }
 
 
@@ -337,17 +304,15 @@ def _modules_from_config(config: dict[str, Any]) -> dict[str, bool]:
         return {
             "qd": bool(modules.get("qd", True)),
             "incubation": bool(modules.get("incubation", True)),
-            "elite_genetic": bool(modules.get("elite_genetic", False)),
         }
-    return {"qd": True, "incubation": True, "elite_genetic": False}
+    return {"qd": True, "incubation": True}
 
 
 def _modules_from_legacy_name(name: str) -> dict[str, bool]:
     mode = name.strip().lower()
     return {
-        "qd": "qd" in mode or mode == "hybrid",
-        "incubation": "incubation" in mode or mode == "hybrid",
-        "elite_genetic": "elite_genetic" in mode,
+        "qd": mode in {"qd", "qd_incubation", "hybrid"},
+        "incubation": mode in {"incubation", "qd_incubation", "hybrid"},
     }
 
 
@@ -366,10 +331,10 @@ def _load_replay_config(value: str | dict[str, Any] | None = None) -> dict[str, 
     return {"modules": _modules_from_legacy_name(legacy)}
 
 
-def build_replay_policy(name: str | dict[str, Any] | None = None, *, sampler=None) -> ReplayPolicy:
+def build_replay_policy(name: str | dict[str, Any] | None = None) -> ReplayPolicy:
     config = _load_replay_config(name)
     modules = _modules_from_config(config)
-    if not any(modules.values()):
+    if not modules["qd"] and not modules["incubation"]:
         return NoReplayPolicy()
     if isinstance(name, str):
         mode = name.strip().lower()
@@ -377,9 +342,4 @@ def build_replay_policy(name: str | dict[str, Any] | None = None, *, sampler=Non
         mode = str(getattr(ModelConfig, "REPLAY_POLICY", "qd_incubation")).strip().lower()
     if mode in {"none", "off", "disabled"}:
         return NoReplayPolicy()
-    return QDIncubationReplayPolicy(
-        enable_qd=modules["qd"],
-        enable_incubation=modules["incubation"],
-        enable_elite_genetic=modules["elite_genetic"],
-        sampler=sampler,
-    )
+    return QDIncubationReplayPolicy(enable_qd=modules["qd"], enable_incubation=modules["incubation"])

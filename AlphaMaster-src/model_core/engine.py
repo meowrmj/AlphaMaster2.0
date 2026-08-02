@@ -376,7 +376,7 @@ class AlphaEngine:
         self._elite_counter = 0
         self._incubation_pool: list[tuple[float, int, list[int], int]] = []
         self._incubation_counter = 0
-        self.replay_policy = build_replay_policy(sampler=self.sampler)
+        self.replay_policy = build_replay_policy()
         self.search_plugins = SearchPluginManager(self.sampler)
         self._last_restart_step = -10**9
 
@@ -1209,7 +1209,6 @@ class AlphaEngine:
             timing_replay_plan_ms = (time.perf_counter() - timing_replay0) * 1000.0
             n_incubate = replay_batch.n_incubation
             n_elite = replay_batch.n_elite
-            n_elite_genetic = replay_batch.n_elite_genetic
             elite_frac_eff = replay_batch.elite_frac_effective
             timing_search0 = time.perf_counter()
             search_batch = self.search_plugins.plan(
@@ -1345,7 +1344,6 @@ class AlphaEngine:
             # ── Part B: Elite Replay ─────────────────────────────────
             elite_sample_info = replay_batch.elite_info or {"avg_decay": 0.0, "max_age": 0, "age_list": [], "scores": [], "cells": 0}
             incubation_sample_info = replay_batch.incubation_info or {"max_age": 0, "scores": [], "cells": 0}
-            elite_genetic_info = replay_batch.elite_genetic_info or {"planned": 0, "produced": 0, "parents": 0}
             if n_elite > 0:
                 if step % 100 == 0:
                     tqdm.write(
@@ -1360,13 +1358,6 @@ class AlphaEngine:
                     f"[新方向孵化池 @ 第{step}步] 类型={incubation_sample_info['cells']} "
                     f"回放={n_incubate}/{bs} 最大年龄={incubation_sample_info['max_age']} "
                     f"抽样分数=[{', '.join(f'{s:.3f}' for s in incubation_sample_info['scores'][:3])}...]"
-                )
-            if n_elite_genetic > 0 and step % 100 == 0:
-                tqdm.write(
-                    f"[精英遗传 @ 第{step}步] 子代={n_elite_genetic}/{bs} "
-                    f"父代={elite_genetic_info.get('parents', 0)} "
-                    f"计划={elite_genetic_info.get('planned', 0)} "
-                    f"尝试={elite_genetic_info.get('attempts', 0)}"
                 )
             if False and self._elite_pool and n_elite > 0:
                 ps = []
@@ -1651,7 +1642,7 @@ class AlphaEngine:
             search_metrics = self.search_plugins.metrics()
             tqdm.write(
                 f"[{step+1}/{end_step}] "
-                f"模型={n_policy} 搜索={n_plugin} 孵化={n_incubate} 精英遗传={n_elite_genetic} 精英={n_elite} | "
+                f"模型={n_policy} 搜索={n_plugin} 孵化={n_incubate} 精英={n_elite} | "
                 f"有效={ok_cnt} 无效={none_cnt} 常数={const_cnt} | "
                 f"奖励={avg_rew:.3f} 验证={avg_val:.3f} | "
                 f"IC={bim:.4f} | 熵={ent_val:.3f}(系数={ent_coeff:.3f}) | "
@@ -1723,9 +1714,6 @@ class AlphaEngine:
             self.training_history.setdefault('elite_archive_cells', []).append(
                 replay_metrics["elite_archive_cells"])
             self.training_history.setdefault('elite_replay_used', []).append(n_elite)
-            self.training_history.setdefault('elite_genetic_replay_used', []).append(n_elite_genetic)
-            self.training_history.setdefault('elite_genetic_enabled', []).append(
-                replay_metrics.get("elite_genetic_enabled", 0))
             self.training_history.setdefault('incubation_replay_used', []).append(n_incubate)
             self.training_history.setdefault('policy_generated_used', []).append(n_policy)
             self.training_history.setdefault('search_plugin_used', []).append(n_plugin)
