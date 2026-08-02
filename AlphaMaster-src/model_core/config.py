@@ -200,7 +200,8 @@ class ModelConfig:
     CORR_PENALTY:     float = 0.8
     BEHAVIOR_DEDUP_ENABLED: bool = _env_bool("ALPHAMASTER_BEHAVIOR_DEDUP_ENABLED", True)
     BEHAVIOR_VECTOR_SIZE: int = int(os.getenv("ALPHAMASTER_BEHAVIOR_VECTOR_SIZE", "512"))
-    BEHAVIOR_CORR_THRESHOLD: float = float(os.getenv("ALPHAMASTER_BEHAVIOR_CORR_THRESHOLD", "0.975"))
+    BEHAVIOR_CORR_THRESHOLD: float = float(os.getenv("ALPHAMASTER_BEHAVIOR_CORR_THRESHOLD", "0.950"))
+    BEHAVIOR_CORE_CORR_THRESHOLD: float = float(os.getenv("ALPHAMASTER_BEHAVIOR_CORE_CORR_THRESHOLD", "0.930"))
 
     # ── Walk-Forward Gap ───────────────────────────────────────────────
     # P2-6 修复说明：gap 必须按 target_horizon 标定，且与 CPCV purge gap 统一。

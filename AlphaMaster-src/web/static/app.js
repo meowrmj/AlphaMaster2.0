@@ -866,7 +866,9 @@ function updateFileProgress(progress) {
 
 const CHART_SERIES = [
   { key: "best_score", label: "本轮最优分", borderColor: "#34f5c8", fillRGB: "52, 245, 200", yAxisID: "y" },
-  { key: "new_candidate_best_val_score", label: "新候选最高分（不含精英）", borderColor: "#f97316", fillRGB: "249, 115, 22", yAxisID: "y", pointRadius: 1.4 },
+  { key: "policy_best_val_score", label: "纯模型候选最高分", borderColor: "#fb7185", fillRGB: "251, 113, 133", yAxisID: "y", pointRadius: 1.2 },
+  { key: "genetic_best_val_score", label: "遗传候选最高分", borderColor: "#a78bfa", fillRGB: "167, 139, 250", yAxisID: "y", pointRadius: 1.2 },
+  { key: "new_candidate_best_val_score", label: "新候选最高分（模型+插件）", borderColor: "#f97316", fillRGB: "249, 115, 22", yAxisID: "y", pointRadius: 1.4 },
   { key: "batch_best_val_score", label: "本批最高分（含精英）", borderColor: "#facc15", fillRGB: "250, 204, 21", yAxisID: "y", pointRadius: 1.2 },
   { key: "val_score", label: "当前候选分", borderColor: "#38bdf8", fillRGB: "56, 189, 248", yAxisID: "y" },
 ];
@@ -977,12 +979,8 @@ const CHART_OPTIONS = {
 };
 
 function buildChartDatasets(history) {
-  const hiddenDuplicateKeys = new Set();
-  if (sameFiniteSeries(history?.new_candidate_best_val_score, history?.batch_best_val_score)) {
-    hiddenDuplicateKeys.add("new_candidate_best_val_score");
-  }
   return CHART_SERIES
-    .filter((s) => !hiddenDuplicateKeys.has(s.key) && hasFiniteSeries(history, s.key))
+    .filter((s) => hasFiniteSeries(history, s.key))
     .map((s) => {
     const isBatchBest = s.key === "batch_best_val_score";
     const isNewBest = s.key === "new_candidate_best_val_score";

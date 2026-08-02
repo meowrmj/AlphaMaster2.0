@@ -291,6 +291,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
                 pool,
                 self.behavior_by_formula,
                 float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+                float(getattr(ModelConfig, "BEHAVIOR_CORE_CORR_THRESHOLD", 0.93)),
             )
         if kind == "incubation":
             return self._rebalance_incubation_pool(pool, step)

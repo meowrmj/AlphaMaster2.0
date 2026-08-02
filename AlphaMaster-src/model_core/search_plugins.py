@@ -60,6 +60,7 @@ class SearchPluginManager:
             "produced": 0,
             "parents": 0,
             "parent_source": "none",
+            "operations": {},
         }
         self.behavior_by_formula: dict[tuple[int, ...], list[float]] = {}
 
@@ -136,6 +137,7 @@ class SearchPluginManager:
             "genetic_parent_count": int(self._last_genetic_info.get("parents") or 0),
             "genetic_parent_niches": int(self._last_genetic_info.get("parent_niches") or 0),
             "genetic_parent_source": str(self._last_genetic_info.get("parent_source") or "none"),
+            "genetic_operations": dict(self._last_genetic_info.get("operations") or {}),
             "search_behavior_memory_size": len(self.behavior_by_formula),
         }
 
@@ -221,6 +223,7 @@ class SearchPluginManager:
                 pool,
                 self.behavior_by_formula,
                 float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+                float(getattr(ModelConfig, "BEHAVIOR_CORE_CORR_THRESHOLD", 0.93)),
             )
         return _rebalance_archive(pool)
 

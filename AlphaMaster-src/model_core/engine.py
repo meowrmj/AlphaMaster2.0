@@ -1430,6 +1430,10 @@ class AlphaEngine:
             ok_cnt = none_cnt = const_cnt = 0
             step_max_val = -float('inf');  step_best_f = None
             new_step_max_val = -float('inf');  new_step_best_f = None
+            policy_step_max_val = -float('inf')
+            genetic_step_max_val = -float('inf')
+            plugin_step_max_val = -float('inf')
+            memory_step_max_val = -float('inf')
             bic, bis, bsor = [], [], []
             reward_values = [0.0] * tot
             val_score_values = [0.0] * tot
@@ -1499,6 +1503,15 @@ class AlphaEngine:
                     step_max_val = final_val; step_best_f = fml
                 if i < n_policy + n_plugin and final_val > new_step_max_val:
                     new_step_max_val = final_val; new_step_best_f = fml
+                origin = formula_origins[i] if 0 <= i < len(formula_origins) else ""
+                if origin == "policy" and final_val > policy_step_max_val:
+                    policy_step_max_val = final_val
+                if origin == "genetic" and final_val > genetic_step_max_val:
+                    genetic_step_max_val = final_val
+                if origin in {"annealing", "genetic"} and final_val > plugin_step_max_val:
+                    plugin_step_max_val = final_val
+                if origin == "memory" and final_val > memory_step_max_val:
+                    memory_step_max_val = final_val
 
                 if final_val > self.best_score:
                     # OOS 泛化门控：val_score / train_score < 0.5 说明过拟合
@@ -1533,12 +1546,14 @@ class AlphaEngine:
                                 f"IC={ic_i:.4f} 暴露度={exposure:.1%} | "
                                 f"{fml}\n    {self._decode_formula(fml)}"
                             )
-                replay_observations.append({
-                    "score": final_val,
-                    "formula": fml,
-                    "is_new": i < n_policy + n_plugin,
-                    "behavior": r.get("behavior"),
-                })
+                if origin in {"policy", "annealing", "genetic"}:
+                    replay_observations.append({
+                        "score": final_val,
+                        "formula": fml,
+                        "is_new": True,
+                        "origin": origin,
+                        "behavior": r.get("behavior"),
+                    })
 
             rewards = torch.tensor(reward_values, dtype=torch.float32, device=ModelConfig.DEVICE)
             val_scores = torch.tensor(val_score_values, dtype=torch.float32, device=ModelConfig.DEVICE)
@@ -1729,6 +1744,18 @@ class AlphaEngine:
             self.training_history.setdefault('new_candidate_best_val_score', []).append(
                 new_step_max_val if new_step_max_val != -float('inf') else None
             )
+            self.training_history.setdefault('policy_best_val_score', []).append(
+                policy_step_max_val if policy_step_max_val != -float('inf') else None
+            )
+            self.training_history.setdefault('genetic_best_val_score', []).append(
+                genetic_step_max_val if genetic_step_max_val != -float('inf') else None
+            )
+            self.training_history.setdefault('plugin_best_val_score', []).append(
+                plugin_step_max_val if plugin_step_max_val != -float('inf') else None
+            )
+            self.training_history.setdefault('memory_best_val_score', []).append(
+                memory_step_max_val if memory_step_max_val != -float('inf') else None
+            )
             self.training_history['best_score'].append(self.best_score)
             self.training_history.setdefault('entropy', []).append(ent_val)
             self.training_history.setdefault('ic_mean', []).append(bim)
@@ -1748,6 +1775,10 @@ class AlphaEngine:
                 search_metrics["search_archive_size"])
             self.training_history.setdefault('search_archive_cells', []).append(
                 search_metrics["search_archive_cells"])
+            self.training_history.setdefault('behavior_memory_size', []).append(
+                replay_metrics.get("behavior_memory_size", 0))
+            self.training_history.setdefault('search_behavior_memory_size', []).append(
+                search_metrics.get("search_behavior_memory_size", 0))
             self.training_history.setdefault('anneal_accept_rate', []).append(
                 search_metrics["anneal_accept_rate"])
             self.training_history.setdefault('genetic_planned', []).append(
@@ -1760,6 +1791,22 @@ class AlphaEngine:
                 search_metrics.get("genetic_parent_niches", 0))
             self.training_history.setdefault('genetic_parent_source', []).append(
                 search_metrics.get("genetic_parent_source", "none"))
+            self.training_history.setdefault('genetic_operations', []).append(
+                search_metrics.get("genetic_operations", {}))
+            genetic_ops = search_metrics.get("genetic_operations", {}) or {}
+            for op_name in (
+                "random_immigrant",
+                "subtree_crossover",
+                "subtree_mutation",
+                "feature_mutation",
+                "operator_mutation",
+                "prune_mutation",
+                "expand_mutation",
+                "clone",
+            ):
+                self.training_history.setdefault(f'genetic_op_{op_name}', []).append(
+                    int(genetic_ops.get(op_name, 0))
+                )
             self.training_history.setdefault('incubation_pool_size', []).append(
                 replay_metrics["incubation_pool_size"])
             self.training_history.setdefault('incubation_archive_cells', []).append(

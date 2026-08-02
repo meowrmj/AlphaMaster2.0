@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from .formula_diversity import formula_core_signature
+
 FormulaKey = tuple[int, ...]
 ReplayLikeEntry = tuple[float, int, list[int], int]
 
@@ -116,13 +118,15 @@ def dedupe_entries_by_behavior(
     entries: list[ReplayLikeEntry],
     behavior_by_formula: dict[FormulaKey, list[float]],
     threshold: float,
+    core_threshold: float | None = None,
 ) -> list[ReplayLikeEntry]:
     threshold = float(threshold)
+    core_threshold = threshold if core_threshold is None else float(core_threshold)
     if not entries or threshold >= 1.0:
         return entries
 
     kept: list[ReplayLikeEntry] = []
-    kept_vecs: list[torch.Tensor] = []
+    kept_items: list[tuple[torch.Tensor, tuple[int, ...]]] = []
     for entry in sorted(entries, key=lambda x: (float(x[0]), int(x[1])), reverse=True):
         key = formula_key(entry[2])
         vec = normalize_behavior(behavior_by_formula.get(key))
@@ -135,11 +139,18 @@ def dedupe_entries_by_behavior(
             kept.append(entry)
             continue
         tensor = tensor / norm
-        if kept_vecs:
-            mat = torch.stack(kept_vecs)
-            max_corr = torch.max(torch.abs(mat @ tensor)).item()
-            if max_corr >= threshold:
+        core = formula_core_signature(entry[2])
+        if kept_items:
+            mat = torch.stack([item[0] for item in kept_items])
+            corr_values = torch.abs(mat @ tensor)
+            reject = False
+            for idx, corr in enumerate(corr_values.tolist()):
+                limit = core_threshold if kept_items[idx][1] == core else threshold
+                if float(corr) >= limit:
+                    reject = True
+                    break
+            if reject:
                 continue
         kept.append(entry)
-        kept_vecs.append(tensor)
+        kept_items.append((tensor, core))
     return kept

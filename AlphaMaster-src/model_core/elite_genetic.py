@@ -102,6 +102,16 @@ class EliteGeneticEmitter:
         seen: set[tuple[int, ...]] = set()
         attempts = 0
         max_attempts = max(k * 12, 24)
+        operation_counts: dict[str, int] = {
+            "random_immigrant": 0,
+            "subtree_crossover": 0,
+            "subtree_mutation": 0,
+            "feature_mutation": 0,
+            "operator_mutation": 0,
+            "prune_mutation": 0,
+            "expand_mutation": 0,
+            "clone": 0,
+        }
         random_immigrants = min(
             k,
             int(round(k * float(getattr(ModelConfig, "GA_RANDOM_IMMIGRANT_FRAC", 0.12)))),
@@ -110,20 +120,23 @@ class EliteGeneticEmitter:
             attempts += 1
             if len(produced) < random_immigrants:
                 child = self._random_formula(step + attempts)
+                op_name = "random_immigrant"
             else:
                 p1, p2, _cross_niche = self._select_parent_pair(ranked, niches)
-                child = self._crossover_or_mutate(p1, p2, step + attempts)
+                child, op_name = self._crossover_or_mutate(p1, p2, step + attempts)
             key = tuple(child)
             threshold = float(getattr(ModelConfig, "GA_CHILD_SIMILARITY_MAX", 0.82))
             if child and key not in seen and not is_too_similar(child, produced, threshold):
                 seen.add(key)
                 produced.append(child)
+                operation_counts[op_name] = operation_counts.get(op_name, 0) + 1
         return produced, {
             "planned": int(k),
             "produced": len(produced),
             "parents": len(ranked),
             "parent_niches": len(niches),
             "attempts": attempts,
+            "operations": operation_counts,
         }
 
     def _diverse_parent_pool(
@@ -174,20 +187,23 @@ class EliteGeneticEmitter:
             )
         return self._select_parent(ranked), self._select_parent(ranked), False
 
-    def _crossover_or_mutate(self, p1: list[int], p2: list[int], seed: int) -> list[int]:
+    def _crossover_or_mutate(self, p1: list[int], p2: list[int], seed: int) -> tuple[list[int], str]:
         root1 = _parse_postfix(p1, self.sampler)
         root2 = _parse_postfix(p2, self.sampler)
         if root1 is None:
-            return self._repair_with_prefix([], seed)
+            return self._repair_with_prefix([], seed), "random_immigrant"
         if root2 is None:
             root2 = root1
         if random.random() < float(getattr(ModelConfig, "GA_CROSSOVER_RATE", 0.70)):
             child_root = self._subtree_crossover(root1, root2)
+            op_name = "subtree_crossover"
         else:
             child_root = _clone_node(root1)
+            op_name = "clone"
         if random.random() < float(getattr(ModelConfig, "GA_MUTATION_RATE", 0.45)):
-            child_root = self._subtree_mutation(child_root, seed)
-        return self._repair_with_prefix(_to_postfix(child_root), seed)
+            child_root, mutation_name = self._multi_level_mutation(child_root, seed)
+            op_name = mutation_name
+        return self._repair_with_prefix(_to_postfix(child_root), seed), op_name
 
     def _subtree_crossover(self, root1: FormulaNode, root2: FormulaNode) -> FormulaNode:
         path1 = random.choice(_paths(root1))
@@ -201,6 +217,70 @@ class EliteGeneticEmitter:
         path = random.choice(_paths(root))
         donor_path = random.choice(_paths(donor))
         return _replace_subtree(root, path, _get_subtree(donor, donor_path))
+
+    def _multi_level_mutation(self, root: FormulaNode, seed: int) -> tuple[FormulaNode, str]:
+        modes = (
+            "feature_mutation",
+            "operator_mutation",
+            "subtree_mutation",
+            "prune_mutation",
+            "expand_mutation",
+        )
+        for mode in random.sample(modes, k=len(modes)):
+            if mode == "feature_mutation":
+                mutated = self._feature_point_mutation(root)
+            elif mode == "operator_mutation":
+                mutated = self._operator_point_mutation(root)
+            elif mode == "prune_mutation":
+                mutated = self._prune_mutation(root)
+            elif mode == "expand_mutation":
+                mutated = self._expand_mutation(root, seed)
+            else:
+                mutated = self._subtree_mutation(root, seed)
+            if _to_postfix(mutated) != _to_postfix(root):
+                return mutated, mode
+        return self._subtree_mutation(root, seed), "subtree_mutation"
+
+    def _feature_point_mutation(self, root: FormulaNode) -> FormulaNode:
+        paths = [path for path in _paths(root) if _get_subtree(root, path).token < self.sampler.feat_offset]
+        if not paths:
+            return root
+        path = random.choice(paths)
+        old = _get_subtree(root, path).token
+        choices = [idx for idx in range(self.sampler.feat_offset) if idx != old]
+        if not choices:
+            return root
+        return _replace_subtree(root, path, FormulaNode(random.choice(choices), []))
+
+    def _operator_point_mutation(self, root: FormulaNode) -> FormulaNode:
+        paths = [path for path in _paths(root) if _get_subtree(root, path).token >= self.sampler.feat_offset]
+        if not paths:
+            return root
+        path = random.choice(paths)
+        node = _get_subtree(root, path)
+        arity = int(self.sampler.arity_map.get(node.token, len(node.children)))
+        choices = [
+            token for token in range(self.sampler.feat_offset, self.sampler.vocab_size)
+            if token != node.token and int(self.sampler.arity_map.get(token, 1)) == arity
+        ]
+        if not choices:
+            return root
+        return _replace_subtree(root, path, FormulaNode(random.choice(choices), [_clone_node(c) for c in node.children]))
+
+    def _prune_mutation(self, root: FormulaNode) -> FormulaNode:
+        paths = [path for path in _paths(root) if _get_subtree(root, path).children]
+        if not paths:
+            return root
+        path = random.choice(paths)
+        node = _get_subtree(root, path)
+        return _replace_subtree(root, path, random.choice(node.children))
+
+    def _expand_mutation(self, root: FormulaNode, seed: int) -> FormulaNode:
+        donor = _parse_postfix(self._random_formula(seed), self.sampler)
+        if donor is None:
+            return root
+        path = random.choice(_paths(root))
+        return _replace_subtree(root, path, donor)
 
     def _random_formula(self, seed: int) -> list[int]:
         return self._repair_with_prefix([], seed)
