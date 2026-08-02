@@ -8,7 +8,12 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
-from .formula_diversity import formula_core_signature, is_too_similar
+from .formula_diversity import (
+    formula_core_signature,
+    formula_niche_key,
+    formula_start_token,
+    is_too_similar,
+)
 
 
 @dataclass
@@ -90,6 +95,7 @@ class EliteGeneticEmitter:
         ranked = self._diverse_parent_pool(
             sorted(elite_pool, key=lambda item: (float(item[0]), int(item[1])), reverse=True)
         )
+        niches = self._build_parent_niches(ranked)
         if len(ranked) < 2:
             return [], {"planned": int(k), "produced": 0, "parents": len(elite_pool), "attempts": 0}
         produced: list[list[int]] = []
@@ -105,8 +111,7 @@ class EliteGeneticEmitter:
             if len(produced) < random_immigrants:
                 child = self._random_formula(step + attempts)
             else:
-                p1 = self._select_parent(ranked)
-                p2 = self._select_parent(ranked)
+                p1, p2, _cross_niche = self._select_parent_pair(ranked, niches)
                 child = self._crossover_or_mutate(p1, p2, step + attempts)
             key = tuple(child)
             threshold = float(getattr(ModelConfig, "GA_CHILD_SIMILARITY_MAX", 0.82))
@@ -117,6 +122,7 @@ class EliteGeneticEmitter:
             "planned": int(k),
             "produced": len(produced),
             "parents": len(ranked),
+            "parent_niches": len(niches),
             "attempts": attempts,
         }
 
@@ -125,17 +131,48 @@ class EliteGeneticEmitter:
         ranked: list[tuple[float, int, list[int], int]],
     ) -> list[tuple[float, int, list[int], int]]:
         core_cap = max(1, int(getattr(ModelConfig, "GA_PARENT_CORE_CAP", 4)))
+        start_cap = max(1, int(getattr(ModelConfig, "GA_PARENT_START_TOKEN_CAP", 8)))
         by_core: dict[tuple[int, ...], list[tuple[float, int, list[int], int]]] = {}
         for entry in ranked:
             by_core.setdefault(formula_core_signature(entry[2]), []).append(entry)
-        out: list[tuple[float, int, list[int], int]] = []
+        core_limited: list[tuple[float, int, list[int], int]] = []
         for entries in by_core.values():
-            out.extend(entries[:core_cap])
+            core_limited.extend(entries[:core_cap])
+        by_start: dict[int, list[tuple[float, int, list[int], int]]] = {}
+        for entry in sorted(core_limited, key=lambda item: (float(item[0]), int(item[1])), reverse=True):
+            by_start.setdefault(formula_start_token(entry[2]), []).append(entry)
+        out: list[tuple[float, int, list[int], int]] = []
+        for entries in by_start.values():
+            out.extend(entries[:start_cap])
         return sorted(out, key=lambda item: (float(item[0]), int(item[1])), reverse=True)
 
     def _select_parent(self, ranked: list[tuple[float, int, list[int], int]]) -> list[int]:
         k = min(max(2, int(getattr(ModelConfig, "GA_TOURNAMENT_K", 4))), len(ranked))
         return list(max(random.sample(ranked, k), key=lambda item: float(item[0]))[2])
+
+    def _build_parent_niches(
+        self,
+        ranked: list[tuple[float, int, list[int], int]],
+    ) -> dict[tuple, list[tuple[float, int, list[int], int]]]:
+        niches: dict[tuple, list[tuple[float, int, list[int], int]]] = {}
+        for entry in ranked:
+            niches.setdefault(formula_niche_key(entry[2]), []).append(entry)
+        return {key: entries for key, entries in niches.items() if entries}
+
+    def _select_parent_pair(
+        self,
+        ranked: list[tuple[float, int, list[int], int]],
+        niches: dict[tuple, list[tuple[float, int, list[int], int]]],
+    ) -> tuple[list[int], list[int], bool]:
+        if len(niches) >= 2 and random.random() < float(getattr(ModelConfig, "GA_CROSS_NICHE_RATE", 0.85)):
+            keys = list(niches.keys())
+            k1, k2 = random.sample(keys, 2)
+            return (
+                self._select_parent(niches[k1]),
+                self._select_parent(niches[k2]),
+                True,
+            )
+        return self._select_parent(ranked), self._select_parent(ranked), False
 
     def _crossover_or_mutate(self, p1: list[int], p2: list[int], seed: int) -> list[int]:
         root1 = _parse_postfix(p1, self.sampler)

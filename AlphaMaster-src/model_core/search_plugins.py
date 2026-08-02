@@ -18,7 +18,7 @@ import torch
 
 from .config import ModelConfig
 from .elite_genetic import EliteGeneticEmitter
-from .formula_diversity import formula_core_signature
+from .formula_diversity import formula_core_signature, formula_start_token
 from .replay_policies import ReplayEntry, formula_bucket_key
 from .vocab import FORMULA_VOCAB
 
@@ -123,6 +123,7 @@ class SearchPluginManager:
             "genetic_planned": int(self._last_genetic_info.get("planned") or 0),
             "genetic_produced": int(self._last_genetic_info.get("produced") or 0),
             "genetic_parent_count": int(self._last_genetic_info.get("parents") or 0),
+            "genetic_parent_niches": int(self._last_genetic_info.get("parent_niches") or 0),
             "genetic_parent_source": str(self._last_genetic_info.get("parent_source") or "none"),
         }
 
@@ -295,4 +296,11 @@ def _rebalance_archive(pool: list[ReplayEntry]) -> list[ReplayEntry]:
     diverse: list[ReplayEntry] = []
     for entries in by_core.values():
         diverse.extend(entries[:core_cap])
-    return sorted(diverse, key=lambda x: (x[0], x[1]), reverse=True)[:cap]
+    start_cap = max(1, int(getattr(ModelConfig, "SEARCH_START_TOKEN_CAP", 16)))
+    by_start: dict[int, list[ReplayEntry]] = {}
+    for entry in sorted(diverse, key=lambda x: (x[0], x[1]), reverse=True):
+        by_start.setdefault(formula_start_token(entry[2]), []).append(entry)
+    start_diverse: list[ReplayEntry] = []
+    for entries in by_start.values():
+        start_diverse.extend(entries[:start_cap])
+    return sorted(start_diverse, key=lambda x: (x[0], x[1]), reverse=True)[:cap]

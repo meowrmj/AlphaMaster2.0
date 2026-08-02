@@ -1739,6 +1739,8 @@ class AlphaEngine:
                 search_metrics.get("genetic_produced", 0))
             self.training_history.setdefault('genetic_parent_count', []).append(
                 search_metrics.get("genetic_parent_count", 0))
+            self.training_history.setdefault('genetic_parent_niches', []).append(
+                search_metrics.get("genetic_parent_niches", 0))
             self.training_history.setdefault('genetic_parent_source', []).append(
                 search_metrics.get("genetic_parent_source", "none"))
             self.training_history.setdefault('incubation_pool_size', []).append(

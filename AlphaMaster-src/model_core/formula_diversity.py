@@ -107,6 +107,28 @@ def formula_behavior_key(formula: list[int]) -> tuple:
     )
 
 
+def formula_start_token(formula: list[int]) -> int:
+    op_offset = FORMULA_VOCAB.operator_offset
+    for raw in formula:
+        token = int(raw)
+        if 0 <= token < op_offset:
+            return token
+    return -1
+
+
+def formula_start_family(formula: list[int]) -> str:
+    token = formula_start_token(formula)
+    return feature_family(token_name(token)) if token >= 0 else "none"
+
+
+def formula_niche_key(formula: list[int]) -> tuple:
+    return (
+        formula_start_family(formula),
+        formula_start_token(formula),
+        formula_behavior_key(formula),
+    )
+
+
 def formula_core_signature(formula: list[int]) -> tuple[int, ...]:
     names = FORMULA_VOCAB.token_names
     op_offset = FORMULA_VOCAB.operator_offset

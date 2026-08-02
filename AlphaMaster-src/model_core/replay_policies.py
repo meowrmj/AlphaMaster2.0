@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import ModelConfig
-from .formula_diversity import formula_behavior_key, formula_core_signature
+from .formula_diversity import formula_behavior_key, formula_core_signature, formula_start_token
 
 ReplayEntry = tuple[float, int, list[int], int]
 
@@ -43,6 +43,16 @@ def _cap_by_core(pool: list[ReplayEntry], core_cap: int) -> list[ReplayEntry]:
     kept: list[ReplayEntry] = []
     for entries in by_core.values():
         kept.extend(entries[:core_cap])
+    return kept
+
+
+def _cap_by_start_token(pool: list[ReplayEntry], start_cap: int) -> list[ReplayEntry]:
+    by_start: dict[int, list[ReplayEntry]] = {}
+    for entry in sorted(pool, key=lambda x: (x[0], x[1]), reverse=True):
+        by_start.setdefault(formula_start_token(entry[2]), []).append(entry)
+    kept: list[ReplayEntry] = []
+    for entries in by_start.values():
+        kept.extend(entries[:start_cap])
     return kept
 
 
@@ -123,6 +133,8 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             kept.extend(sorted(entries, key=lambda x: (x[0], x[1]), reverse=True)[:bucket_cap])
         core_cap = max(1, int(getattr(ModelConfig, "ELITE_CORE_CAP", 8)))
         kept = _cap_by_core(kept, core_cap)
+        start_cap = max(1, int(getattr(ModelConfig, "ELITE_START_TOKEN_CAP", 12)))
+        kept = _cap_by_start_token(kept, start_cap)
         return sorted(kept, key=lambda x: (x[0], x[1]), reverse=True)[:global_cap]
 
     @staticmethod
@@ -149,6 +161,8 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             kept.extend(sorted(entries, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:bucket_cap])
         core_cap = max(1, int(getattr(ModelConfig, "INCUBATION_CORE_CAP", 6)))
         kept = _cap_by_core(kept, core_cap)
+        start_cap = max(1, int(getattr(ModelConfig, "INCUBATION_START_TOKEN_CAP", 8)))
+        kept = _cap_by_start_token(kept, start_cap)
         return sorted(kept, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:global_cap]
 
     def _sample_elite(self, step: int, k: int) -> tuple[list[list[int]], dict[str, Any]]:
