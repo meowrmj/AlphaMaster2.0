@@ -1,6 +1,9 @@
 const API = "";
 const DEFAULT_CHART_WINDOW = 360;
-const MAX_RENDERED_CHART_POINTS = 1400;
+const CHART_LOD_FULL_POINTS = 1200;
+const CHART_LOD_MEDIUM_POINTS = 1200;
+const CHART_LOD_LARGE_POINTS = 800;
+const CHART_LOD_EXTREME_POINTS = 520;
 let selectedDataFile = null;
 let selectedSymbol = null;
 let dataRootDir = "";
@@ -987,7 +990,8 @@ const CHART_OPTIONS = {
   },
 };
 
-function buildChartDatasets(history) {
+function buildChartDatasets(history, renderMeta = {}) {
+  const simplified = Boolean(renderMeta.simplified);
   return CHART_SERIES
     .filter((s) => hasFiniteSeries(history, s.key))
     .map((s) => {
@@ -999,15 +1003,15 @@ function buildChartDatasets(history) {
       data: finiteSeries(history, s.key),
       borderColor: s.borderColor,
       borderWidth: 2,
-      tension: 0.35,
-      pointRadius: isBatchBest || isNewBest ? 0 : s.pointRadius ?? 0,
-      pointHitRadius: 8,
-      pointHoverRadius: 4,
+      tension: simplified ? 0 : 0.35,
+      pointRadius: simplified ? 0 : (isBatchBest || isNewBest ? 0 : s.pointRadius ?? 0),
+      pointHitRadius: simplified ? 3 : 8,
+      pointHoverRadius: simplified ? 0 : 4,
       pointHoverBackgroundColor: s.borderColor,
       pointHoverBorderColor: "#05070d",
       spanGaps: false,
       fill: false,
-      glowBlur: isBatchBest ? 2 : isNewBest ? 3 : 5,
+      glowBlur: simplified ? 0 : (isBatchBest ? 2 : isNewBest ? 3 : 5),
       backgroundColor: (context) => {
         const { ctx, chartArea } = context.chart;
         return makeGradient(ctx, chartArea, s.fillRGB, fillAlpha);
@@ -1030,10 +1034,10 @@ function destroyChart() {
   chartFullHistory = null;
 }
 
-function createChart(ctx, steps, history) {
+function createChart(ctx, steps, history, renderMeta = {}) {
   return new Chart(ctx, {
     type: "line",
-    data: { labels: steps, datasets: buildChartDatasets(history) },
+    data: { labels: steps, datasets: buildChartDatasets(history, renderMeta) },
     options: CHART_OPTIONS,
   });
 }
@@ -1059,11 +1063,19 @@ function sliceChartHistory(history, start, end, fullLen) {
   return sliced;
 }
 
+function chartRenderTarget(count) {
+  if (!Number.isFinite(count) || count <= CHART_LOD_FULL_POINTS) return count;
+  if (count <= 3000) return CHART_LOD_MEDIUM_POINTS;
+  if (count <= 7000) return CHART_LOD_LARGE_POINTS;
+  return CHART_LOD_EXTREME_POINTS;
+}
+
 function pickChartRenderIndices(history, start, end, fullLen) {
   const count = end - start;
-  if (!Number.isFinite(count) || count <= MAX_RENDERED_CHART_POINTS) return null;
+  const target = chartRenderTarget(count);
+  if (!Number.isFinite(count) || count <= target) return null;
   const indices = new Set([0, count - 1]);
-  const bucketCount = Math.max(1, Math.floor(MAX_RENDERED_CHART_POINTS / 4));
+  const bucketCount = Math.max(1, Math.floor(target / 4));
   const bucketSize = count / bucketCount;
   const keys = CHART_SERIES.map((s) => s.key).filter((key) => Array.isArray(history?.[key]));
   for (let bucket = 0; bucket < bucketCount; bucket += 1) {
@@ -1122,6 +1134,7 @@ function getVisibleChartData() {
     history,
     renderedCount: steps.length,
     visibleCount: end - start,
+    simplified: Boolean(indices),
   };
 }
 
@@ -1129,7 +1142,7 @@ function syncVisibleChartData() {
   if (!chart || !chartFullSteps.length) return;
   const visible = getVisibleChartData();
   chart.data.labels = visible.steps;
-  const next = buildChartDatasets(visible.history);
+  const next = buildChartDatasets(visible.history, visible);
   for (const ds of next) {
     const existing = chart.data.datasets.find((d) => d.label === ds.label);
     if (existing) {
@@ -1407,7 +1420,7 @@ function renderChart(history, label, progress) {
     chartAutoFollow = true;
     followLatestChartWindow(steps.length);
     const visible = getVisibleChartData();
-    chart = createChart(ctx, visible.steps, visible.history);
+    chart = createChart(ctx, visible.steps, visible.history, visible);
     chartSymbol = label;
     updateChartTooltipMode();
     applyChartZoom("none");
