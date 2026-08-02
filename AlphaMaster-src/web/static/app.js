@@ -1,5 +1,6 @@
 const API = "";
 const DEFAULT_CHART_WINDOW = 360;
+const MAX_RENDERED_CHART_POINTS = 1400;
 let selectedDataFile = null;
 let selectedSymbol = null;
 let dataRootDir = "";
@@ -1056,12 +1057,69 @@ function sliceChartHistory(history, start, end, fullLen) {
   return sliced;
 }
 
+function pickChartRenderIndices(history, start, end, fullLen) {
+  const count = end - start;
+  if (!Number.isFinite(count) || count <= MAX_RENDERED_CHART_POINTS) return null;
+  const indices = new Set([0, count - 1]);
+  const bucketCount = Math.max(1, Math.floor(MAX_RENDERED_CHART_POINTS / 4));
+  const bucketSize = count / bucketCount;
+  const keys = CHART_SERIES.map((s) => s.key).filter((key) => Array.isArray(history?.[key]));
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const lo = Math.floor(bucket * bucketSize);
+    const hi = Math.min(count, Math.ceil((bucket + 1) * bucketSize));
+    if (hi <= lo) continue;
+    indices.add(lo);
+    indices.add(hi - 1);
+    let minIdx = -1;
+    let maxIdx = -1;
+    let minValue = Infinity;
+    let maxValue = -Infinity;
+    for (let local = lo; local < hi; local += 1) {
+      const abs = start + local;
+      for (const key of keys) {
+        if (history[key].length !== fullLen) continue;
+        const value = Number(history[key][abs]);
+        if (!Number.isFinite(value)) continue;
+        if (value < minValue) {
+          minValue = value;
+          minIdx = local;
+        }
+        if (value > maxValue) {
+          maxValue = value;
+          maxIdx = local;
+        }
+      }
+    }
+    if (minIdx >= 0) indices.add(minIdx);
+    if (maxIdx >= 0) indices.add(maxIdx);
+  }
+  return Array.from(indices).sort((a, b) => a - b);
+}
+
+function takeChartIndexedValues(values, start, end, fullLen, indices) {
+  if (!Array.isArray(values) || values.length !== fullLen) return values;
+  if (!indices) return values.slice(start, end);
+  return indices.map((idx) => values[start + idx]);
+}
+
 function getVisibleChartData() {
   const total = chartTotalPoints();
   const { start, end } = visibleChartBounds(total);
+  const indices = pickChartRenderIndices(chartFullHistory, start, end, total);
+  const steps = indices
+    ? indices.map((idx) => chartFullSteps[start + idx])
+    : chartFullSteps.slice(start, end);
+  const history = {};
+  if (chartFullHistory && typeof chartFullHistory === "object") {
+    for (const [key, value] of Object.entries(chartFullHistory)) {
+      history[key] = takeChartIndexedValues(value, start, end, total, indices);
+    }
+  }
   return {
-    steps: chartFullSteps.slice(start, end),
-    history: sliceChartHistory(chartFullHistory, start, end, total),
+    steps,
+    history,
+    renderedCount: steps.length,
+    visibleCount: end - start,
   };
 }
 
@@ -1354,11 +1412,16 @@ function renderChart(history, label, progress) {
   }
 
   $("chartTitle").textContent = `${label} 训练曲线`;
+  const visibleCount = chartZoom.min == null ? steps.length : chartZoom.max - chartZoom.min + 1;
+  const renderedCount = chart?.data?.labels?.length || 0;
+  const renderText = renderedCount && renderedCount < visibleCount
+    ? ` · 渲染 ${renderedCount}/${visibleCount}`
+    : "";
   const windowText = chartZoom.min == null
     ? `${steps.length} 个记录点`
     : `${steps.length} 个记录点 · 显示 ${chartZoom.min + 1}-${chartZoom.max + 1}`;
   const followText = chartAutoFollow ? "跟随最新" : "查看历史";
-  $("chartHint").textContent = `${windowText} · ${followText} · 滚轮缩放，拖动平移，双击回到最新`;
+  $("chartHint").textContent = `${windowText}${renderText} · ${followText} · 滚轮缩放，拖动平移，双击回到最新`;
 }
 
 async function loadSymbolChart(symbol, progress) {
