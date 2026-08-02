@@ -114,12 +114,14 @@ class ModelConfig:
     ELITE_POOL_SIZE:    int   = 60    # 30→60：大空间需要更大的精英记忆
     ELITE_REWARD_SCALE: float = 0.4
     ELITE_BUCKET_CAP:   int   = 3
+    ELITE_CORE_CAP:     int   = int(os.getenv("ALPHAMASTER_ELITE_CORE_CAP", "8"))
     ELITE_REPLAY_COOLDOWN_STEPS: int = 80
     ELITE_REPLAY_RECOVERY_STEPS: int = 120
 
     # 重启后的“新方向孵化池”：保护冷却期产生的新公式，避免还没成熟就被历史高分精英挤掉。
     INCUBATION_POOL_SIZE: int = 36
     INCUBATION_BUCKET_CAP: int = 2
+    INCUBATION_CORE_CAP: int = int(os.getenv("ALPHAMASTER_INCUBATION_CORE_CAP", "6"))
     INCUBATION_CAPTURE_STEPS: int = 180
     INCUBATION_REPLAY_STEPS: int = 260
     INCUBATION_REPLAY_FRAC: float = 0.08
@@ -130,11 +132,15 @@ class ModelConfig:
     SEARCH_PLUGIN_FRAC: float = float(os.getenv("ALPHAMASTER_SEARCH_PLUGIN_FRAC", "0.20"))
     SEARCH_ARCHIVE_SIZE: int = int(os.getenv("ALPHAMASTER_SEARCH_ARCHIVE_SIZE", "96"))
     SEARCH_BUCKET_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_BUCKET_CAP", "4"))
+    SEARCH_CORE_CAP: int = int(os.getenv("ALPHAMASTER_SEARCH_CORE_CAP", "12"))
     ANNEAL_TEMP: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP", "0.35"))
     ANNEAL_TEMP_MIN: float = float(os.getenv("ALPHAMASTER_ANNEAL_TEMP_MIN", "0.03"))
     ANNEAL_DECAY: float = float(os.getenv("ALPHAMASTER_ANNEAL_DECAY", "0.997"))
     GA_MUTATION_RATE: float = float(os.getenv("ALPHAMASTER_GA_MUTATION_RATE", "0.45"))
     GA_TOURNAMENT_K: int = int(os.getenv("ALPHAMASTER_GA_TOURNAMENT_K", "4"))
+    GA_PARENT_CORE_CAP: int = int(os.getenv("ALPHAMASTER_GA_PARENT_CORE_CAP", "4"))
+    GA_CHILD_SIMILARITY_MAX: float = float(os.getenv("ALPHAMASTER_GA_CHILD_SIMILARITY_MAX", "0.82"))
+    GA_RANDOM_IMMIGRANT_FRAC: float = float(os.getenv("ALPHAMASTER_GA_RANDOM_IMMIGRANT_FRAC", "0.12"))
     GA_POPULATION_SIZE: int = int(os.getenv("ALPHAMASTER_GA_POPULATION_SIZE", "384"))
     GA_ELITE_FRAC: float = float(os.getenv("ALPHAMASTER_GA_ELITE_FRAC", "0.06"))
     GA_RANDOM_INJECT_FRAC: float = float(os.getenv("ALPHAMASTER_GA_RANDOM_INJECT_FRAC", "0.08"))

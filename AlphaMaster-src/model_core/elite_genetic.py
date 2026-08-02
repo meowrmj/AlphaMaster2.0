@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
+from .formula_diversity import formula_core_signature, is_too_similar
 
 
 @dataclass
@@ -86,26 +87,51 @@ class EliteGeneticEmitter:
     ) -> tuple[list[list[int]], dict[str, Any]]:
         if k <= 0 or len(elite_pool) < 2:
             return [], {"planned": int(max(0, k)), "produced": 0, "parents": len(elite_pool), "attempts": 0}
-        ranked = sorted(elite_pool, key=lambda item: (float(item[0]), int(item[1])), reverse=True)
+        ranked = self._diverse_parent_pool(
+            sorted(elite_pool, key=lambda item: (float(item[0]), int(item[1])), reverse=True)
+        )
+        if len(ranked) < 2:
+            return [], {"planned": int(k), "produced": 0, "parents": len(elite_pool), "attempts": 0}
         produced: list[list[int]] = []
         seen: set[tuple[int, ...]] = set()
         attempts = 0
-        max_attempts = max(k * 8, 16)
+        max_attempts = max(k * 12, 24)
+        random_immigrants = min(
+            k,
+            int(round(k * float(getattr(ModelConfig, "GA_RANDOM_IMMIGRANT_FRAC", 0.12)))),
+        )
         while len(produced) < k and attempts < max_attempts:
             attempts += 1
-            p1 = self._select_parent(ranked)
-            p2 = self._select_parent(ranked)
-            child = self._crossover_or_mutate(p1, p2, step + attempts)
+            if len(produced) < random_immigrants:
+                child = self._random_formula(step + attempts)
+            else:
+                p1 = self._select_parent(ranked)
+                p2 = self._select_parent(ranked)
+                child = self._crossover_or_mutate(p1, p2, step + attempts)
             key = tuple(child)
-            if child and key not in seen:
+            threshold = float(getattr(ModelConfig, "GA_CHILD_SIMILARITY_MAX", 0.82))
+            if child and key not in seen and not is_too_similar(child, produced, threshold):
                 seen.add(key)
                 produced.append(child)
         return produced, {
             "planned": int(k),
             "produced": len(produced),
-            "parents": len(elite_pool),
+            "parents": len(ranked),
             "attempts": attempts,
         }
+
+    def _diverse_parent_pool(
+        self,
+        ranked: list[tuple[float, int, list[int], int]],
+    ) -> list[tuple[float, int, list[int], int]]:
+        core_cap = max(1, int(getattr(ModelConfig, "GA_PARENT_CORE_CAP", 4)))
+        by_core: dict[tuple[int, ...], list[tuple[float, int, list[int], int]]] = {}
+        for entry in ranked:
+            by_core.setdefault(formula_core_signature(entry[2]), []).append(entry)
+        out: list[tuple[float, int, list[int], int]] = []
+        for entries in by_core.values():
+            out.extend(entries[:core_cap])
+        return sorted(out, key=lambda item: (float(item[0]), int(item[1])), reverse=True)
 
     def _select_parent(self, ranked: list[tuple[float, int, list[int], int]]) -> list[int]:
         k = min(max(2, int(getattr(ModelConfig, "GA_TOURNAMENT_K", 4))), len(ranked))

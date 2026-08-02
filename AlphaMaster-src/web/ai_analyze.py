@@ -199,7 +199,7 @@ def _system_context(job: dict[str, Any]) -> dict[str, Any]:
             "operators": "树结构交叉、子树变异、约束修复。",
             "effect_on_gradient": "先造候选并统一评估；高分候选进入本批奖励后，才间接影响策略梯度。",
         },
-        "qd_status": "当前是结构型 QD 优秀池；语义行为 QD 分桶仍是蓝图，不应描述为已完全实现。",
+        "qd_status": "当前是结构/行为混合 QD 优秀池：已加入起始特征家族、算子家族、复杂度和核心 token 多样性约束；完整的 IC 稳定性/暴露强弱语义分桶仍是蓝图，不应描述为已完全实现。",
         "removed_modules": ["旧版 elite_genetic 回放插件"],
         "blueprint_file": "docs/training_algorithm_blueprint.md",
     }

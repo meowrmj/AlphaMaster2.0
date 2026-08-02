@@ -18,6 +18,7 @@ import torch
 
 from .config import ModelConfig
 from .elite_genetic import EliteGeneticEmitter
+from .formula_diversity import formula_core_signature
 from .replay_policies import ReplayEntry, formula_bucket_key
 from .vocab import FORMULA_VOCAB
 
@@ -271,6 +272,7 @@ def _load_search_modules() -> dict[str, bool]:
 def _rebalance_archive(pool: list[ReplayEntry]) -> list[ReplayEntry]:
     cap = max(1, int(getattr(ModelConfig, "SEARCH_ARCHIVE_SIZE", 96)))
     bucket_cap = max(1, int(getattr(ModelConfig, "SEARCH_BUCKET_CAP", 4)))
+    core_cap = max(1, int(getattr(ModelConfig, "SEARCH_CORE_CAP", 12)))
     by_formula: dict[tuple[int, ...], ReplayEntry] = {}
     for sc, cnt, toks, birth in pool:
         key = tuple(int(t) for t in toks)
@@ -283,4 +285,10 @@ def _rebalance_archive(pool: list[ReplayEntry]) -> list[ReplayEntry]:
     kept: list[ReplayEntry] = []
     for entries in buckets.values():
         kept.extend(sorted(entries, key=lambda x: (x[0], x[1]), reverse=True)[:bucket_cap])
-    return sorted(kept, key=lambda x: (x[0], x[1]), reverse=True)[:cap]
+    by_core: dict[tuple[int, ...], list[ReplayEntry]] = {}
+    for entry in sorted(kept, key=lambda x: (x[0], x[1]), reverse=True):
+        by_core.setdefault(formula_core_signature(entry[2]), []).append(entry)
+    diverse: list[ReplayEntry] = []
+    for entries in by_core.values():
+        diverse.extend(entries[:core_cap])
+    return sorted(diverse, key=lambda x: (x[0], x[1]), reverse=True)[:cap]

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import ModelConfig
-from .vocab import FORMULA_VOCAB
+from .formula_diversity import formula_behavior_key, formula_core_signature
 
 ReplayEntry = tuple[float, int, list[int], int]
 
@@ -33,29 +33,17 @@ class ReplayBatch:
 
 
 def formula_bucket_key(formula: list[int]) -> tuple:
-    op_offset = getattr(FORMULA_VOCAB, "operator_offset", 0)
-    names = FORMULA_VOCAB.token_names
-    first = int(formula[0]) if formula else -1
-    feat_cnt = sum(1 for t in formula if t < op_offset)
-    ts_cnt = arith_cnt = norm_cnt = nonlinear_cnt = 0
-    for t in formula:
-        name = names[t] if 0 <= t < len(names) else ""
-        if name.startswith("TS_") or name in {"DELAY", "DELTA", "DECAY_LINEAR_5", "PRODUCT_5"}:
-            ts_cnt += 1
-        if name in {"ADD", "SUB", "MUL", "DIV", "NEG"}:
-            arith_cnt += 1
-        if "ZSCORE" in name or "RANK" in name or "SCALE" in name or "NORMALIZE" in name:
-            norm_cnt += 1
-        if name in {"SIGNED_LOG", "TANH_SQUASH", "SIGMOID", "ABS", "SQRT"}:
-            nonlinear_cnt += 1
-    return (
-        first,
-        min(feat_cnt, 3),
-        min(ts_cnt, 3),
-        min(arith_cnt, 2),
-        min(norm_cnt, 2),
-        min(nonlinear_cnt, 2),
-    )
+    return formula_behavior_key(formula)
+
+
+def _cap_by_core(pool: list[ReplayEntry], core_cap: int) -> list[ReplayEntry]:
+    by_core: dict[tuple[int, ...], list[ReplayEntry]] = {}
+    for entry in sorted(pool, key=lambda x: (x[0], x[1]), reverse=True):
+        by_core.setdefault(formula_core_signature(entry[2]), []).append(entry)
+    kept: list[ReplayEntry] = []
+    for entries in by_core.values():
+        kept.extend(entries[:core_cap])
+    return kept
 
 
 class ReplayPolicy:
@@ -123,6 +111,8 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         kept: list[ReplayEntry] = []
         for entries in buckets.values():
             kept.extend(sorted(entries, key=lambda x: (x[0], x[1]), reverse=True)[:bucket_cap])
+        core_cap = max(1, int(getattr(ModelConfig, "ELITE_CORE_CAP", 8)))
+        kept = _cap_by_core(kept, core_cap)
         return sorted(kept, key=lambda x: (x[0], x[1]), reverse=True)[:global_cap]
 
     @staticmethod
@@ -147,6 +137,8 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         kept: list[ReplayEntry] = []
         for entries in buckets.values():
             kept.extend(sorted(entries, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:bucket_cap])
+        core_cap = max(1, int(getattr(ModelConfig, "INCUBATION_CORE_CAP", 6)))
+        kept = _cap_by_core(kept, core_cap)
         return sorted(kept, key=lambda x: (x[0], -x[3], x[1]), reverse=True)[:global_cap]
 
     def _sample_elite(self, step: int, k: int) -> tuple[list[list[int]], dict[str, Any]]:
