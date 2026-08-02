@@ -17,7 +17,9 @@ _MAX_HISTORY_PER_KEY = 5
 _SYSTEM_PROMPT = """你是量化因子挖掘与强化学习训练顾问。用户正在用 AlphaMaster / AlphaGPT 训练可解释因子公式。
 
 回答要求：
-- 用中文，尽量说人话，少用术语。
+- 必须全程使用简体中文，只允许公式 token、字段名、文件名保留英文原样；不要写英文段落、英文小标题或英文解释。
+- 只输出最终分析，不要输出“我需要先分析”“用户想问的是”“首先我思考”等推理过程或草稿。
+- 说人话，少用术语；必须让用户能看懂当前系统到底在做什么。
 - 不要编造快照里没有的数据。
 - 结论必须先分清“训练流程是否正常”和“策略质量是否值得信任”，不要混成一句话。
 - 评估是否值得继续训练时，必须同时看 val_score、best_score、batch_best_val_score、new_candidate_best_val_score、entropy、elite_replay_used、timing_*。不要只看单个指标。
@@ -27,6 +29,11 @@ _SYSTEM_PROMPT = """你是量化因子挖掘与强化学习训练顾问。用户
 - entropy 上升通常表示重新探索/分布变松，不要简单说成“瞎探索”；entropy 很低且多样性下降才更像坍缩。
 - elite_replay_used 表示本步注入了多少条优秀旧公式。当前系统使用 QD 优秀池 + 冷却恢复机制：重启后先降低精英回放，再逐步恢复，目的是减少旧冠军把模型拉回同一方向。
 - incubation_pool / incubation_replay_used 是“新方向孵化池”：重启后的新候选如果结构有差异，即使暂时弱于历史冠军，也会被短期保护和少量回放，用来验证新方向是否能成长。
+- search_config.modules.genetic=true 表示遗传搜索增强已开启；search_plugin_used 或日志里的“搜索=N”表示本步实际造了多少条搜索候选。开启但本步为 0 也可能发生，要按快照判断。
+- search_config.modules.annealing=true 表示退火搜索增强已开启；它基于当前公式做小扰动，接受一部分弱但有潜力的邻域候选，不直接改模型权重。
+- 遗传搜索增强不是旧版“精英回放策略”。新版遗传只在搜索增强层造候选：从 QD 优秀池/搜索档案里选父代，做树结构交叉、子树变异、合法性修复，再统一进入评估。只有评估后真正优秀的公式，才会自然进入 QD、孵化池或冠军。
+- 当前已经实现的是“结构型 QD 优秀池”和“搜索增强插件”；更完整的语义行为 QD 分桶仍是蓝图，不要说成已经完全实现。
+- 回放层和搜索增强层要分开解释：回放层把已有公式放进本批训练；搜索增强层额外造候选公式；Transformer 采样层按模型概率生成新公式；三者最后合并成同一批公式统一评估。
 - 不要因为保存冠军分高、本轮候选分低，就直接说训练坏了；重新训练时本轮分数低于历史保存冠军是正常的。
 - timing_total_ms / timing_eval_ms / timing_sample_elite_ms / timing_grad_ms 用来判断性能瓶颈；如果存在这些字段，说明训练正在记录拆分耗时。
 - “saved_champion” 是当前保存下来的冠军策略，可能来自更早训练。
@@ -34,16 +41,22 @@ _SYSTEM_PROMPT = """你是量化因子挖掘与强化学习训练顾问。用户
 - 第二部分必须分别解释 saved_champion 和 current_run_best 的公式含义；如果两者相同，要明确说它们一致。
 - 公式是栈式 VM 公式，不一定能按“第一步输入第二步”机械解释成线性因果链；解释时可以说大体看哪些量价/波动/方向信息，但不要武断断言一定做多或做空，最终方向要以信号输出和回测为准。
 
-必须使用这两个小标题：
+必须使用这些小标题：
 
 ## 1. 当前训练情况怎么样？是否值得继续
 说明进度、训练是否活着、当前模式、平均验证分、本批最高分、新候选最高分、本轮最优分、熵、精英回放和耗时瓶颈。先判断流程是否正常，再判断策略质量是否可靠，并给出继续训练、观察到某个步数、或先回测的建议。
 
-## 2. 因子的含义与原理
+## 2. 插件有没有生效？现在到底是谁在影响训练
+分别说明回放策略、搜索增强、遗传、退火、评估加速模式的状态。必须解释“开启”和“本步实际产生候选数”不是同一个概念。
+
+## 3. 因子的含义与原理
 分别解释：
 - 保存冠军公式 saved_champion
 - 本轮最优公式 current_run_best
 解释每条公式大概用了哪些信息，以及可能反映的市场状态。必须提醒：这是栈式公式的近似解释，交易方向和有效性要以回测结果为准。
+
+## 4. 下一步建议
+给出具体、克制的下一步建议。不要保证收益，不要把训练分数直接等同于实盘能力。
 """
 
 
@@ -115,6 +128,7 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
     curve = _training_curve(history, max_points=500)
     history_bests = history.get("best_score") or []
     current_run_best_score = max(history_bests) if history_bests else None
+    system_context = _system_context(job)
 
     return {
         "symbol": sym,
@@ -146,8 +160,47 @@ def build_training_snapshot(symbol: str | None = None) -> dict[str, Any]:
             else None
         ),
         "checkpoint_path": progress.checkpoint_path,
+        "system_context": system_context,
         "training_curve": curve,
         "history_summary": _history_summary(history),
+    }
+
+
+def _system_context(job: dict[str, Any]) -> dict[str, Any]:
+    replay_config = job.get("replay_config") or {}
+    search_config = job.get("search_config") or {}
+    replay_modules = replay_config.get("modules") or {}
+    search_modules = search_config.get("modules") or {}
+    return {
+        "architecture_version": "rl_replay_search_split",
+        "algorithm_mode": job.get("algorithm_mode") or "rl",
+        "eval_mode": job.get("eval_mode"),
+        "replay_policy": job.get("replay_policy"),
+        "replay_config": replay_config,
+        "search_config": search_config,
+        "implemented_replay_modules": {
+            "qd": bool(replay_modules.get("qd")),
+            "incubation": bool(replay_modules.get("incubation")),
+        },
+        "implemented_search_modules": {
+            "annealing": bool(search_modules.get("annealing")),
+            "genetic": bool(search_modules.get("genetic")),
+        },
+        "module_contract": {
+            "replay_layer": "只回放已有公式进入本批训练，不直接产生新公式。",
+            "search_layer": "额外制造候选公式，统一评估后才可能进入优秀池、孵化池或冠军。",
+            "transformer_layer": "按当前策略分布逐 token 采样新公式，并用策略梯度更新模型。",
+            "evaluation_layer": "所有来源的公式使用同一套 VM/回测/评分流程，不能跨评分体系比较。",
+        },
+        "genetic_contract": {
+            "role": "搜索增强，不属于精英回放策略。",
+            "parents": "从 QD 优秀池或搜索档案选择父代。",
+            "operators": "树结构交叉、子树变异、约束修复。",
+            "effect_on_gradient": "先造候选并统一评估；高分候选进入本批奖励后，才间接影响策略梯度。",
+        },
+        "qd_status": "当前是结构型 QD 优秀池；语义行为 QD 分桶仍是蓝图，不应描述为已完全实现。",
+        "removed_modules": ["旧版 elite_genetic 回放插件"],
+        "blueprint_file": "docs/training_algorithm_blueprint.md",
     }
 
 
@@ -199,11 +252,16 @@ def analyze_training_stream(
         return
 
     parts = [
+        "必须用简体中文回答，只输出最终分析，不要输出推理过程、草稿或英文解释。",
         "请根据以下训练快照回答：",
         "1. 当前训练情况怎么样？是否值得继续？",
-        "2. 请分别解释 saved_champion（保存冠军公式）和 current_run_best（本轮最优公式）的含义与原理；如果两者相同，请说明它们目前一致。",
+        "2. 当前插件是否真正生效？请区分回放策略、搜索增强、遗传、退火、评估加速模式。",
+        "3. 请分别解释 saved_champion（保存冠军公式）和 current_run_best（本轮最优公式）的含义与原理；如果两者相同，请说明它们目前一致。",
         "",
-        "请特别注意：val_score 是当前步/当前批的平均验证分，不是冠军分；best_score 是本轮运行最大值，横盘不等于卡死；new_candidate_best_val_score 才更能说明模型是否在发现新的高分候选；batch_best_val_score 可能含精英回放；elite_replay_used 要结合 QD 优秀池的冷却/恢复机制理解。",
+        "请特别注意：val_score 是当前步/当前批的平均验证分，不是冠军分；best_score 是本轮运行最大值，横盘不等于卡死；new_candidate_best_val_score 才更能说明模型是否在发现新的高分候选；batch_best_val_score 可能含精英回放；search_plugin_used 才能说明本步搜索增强实际用了多少候选；elite_replay_used 要结合 QD 优秀池的冷却/恢复机制理解。",
+        "",
+        "【系统结构说明】",
+        "当前训练架构已经拆成三层：回放层负责把已有优秀公式放入本批；搜索增强层负责额外制造候选公式；Transformer 采样层负责按模型概率生成新公式。三路公式合并后统一评估，只有评估后的优秀公式才会进入 QD、孵化池或冠军。遗传属于搜索增强，不是旧版精英回放策略。",
         "",
         "【当前训练快照】",
         f"```json\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n```",
@@ -351,11 +409,30 @@ def _training_curve(history: dict[str, Any], max_points: int = 500) -> dict[str,
         "incubation_replay_used",
         "incubation_pool_size",
         "incubation_archive_cells",
+        "search_plugin_used",
+        "search_plugin_modules",
+        "search_archive_size",
+        "search_archive_cells",
+        "anneal_accept_rate",
+        "genetic_planned",
+        "genetic_produced",
+        "genetic_parent_count",
+        "genetic_parent_source",
         "timing_total_ms",
         "timing_sample_elite_ms",
         "timing_eval_ms",
         "timing_grad_ms",
         "timing_rest_ms",
+        "timing_replay_plan_ms",
+        "timing_search_plugin_ms",
+        "timing_ab_forward_ms",
+        "timing_policy_sample_ms",
+        "timing_memory_logprob_ms",
+        "timing_loss_build_ms",
+        "timing_backward_ms",
+        "timing_optimizer_ms",
+        "timing_dist_stats_ms",
+        "eval_engine",
     )
     available = [key for key in keys if isinstance(history.get(key), list) and history.get(key)]
 
@@ -402,10 +479,29 @@ def _history_summary(history: dict[str, Any]) -> dict[str, Any]:
     incubation_replay = history.get("incubation_replay_used") or []
     incubation_pool = history.get("incubation_pool_size") or []
     incubation_cells = history.get("incubation_archive_cells") or []
+    search_used = history.get("search_plugin_used") or []
+    search_modules = history.get("search_plugin_modules") or []
+    search_archive = history.get("search_archive_size") or []
+    search_cells = history.get("search_archive_cells") or []
+    anneal_accept = history.get("anneal_accept_rate") or []
+    genetic_planned = history.get("genetic_planned") or []
+    genetic_produced = history.get("genetic_produced") or []
+    genetic_parent_count = history.get("genetic_parent_count") or []
+    genetic_parent_source = history.get("genetic_parent_source") or []
     timing_total = history.get("timing_total_ms") or []
     timing_eval = history.get("timing_eval_ms") or []
     timing_sample_elite = history.get("timing_sample_elite_ms") or []
     timing_grad = history.get("timing_grad_ms") or []
+    timing_replay_plan = history.get("timing_replay_plan_ms") or []
+    timing_search_plugin = history.get("timing_search_plugin_ms") or []
+    timing_ab_forward = history.get("timing_ab_forward_ms") or []
+    timing_policy_sample = history.get("timing_policy_sample_ms") or []
+    timing_memory_logprob = history.get("timing_memory_logprob_ms") or []
+    timing_loss_build = history.get("timing_loss_build_ms") or []
+    timing_backward = history.get("timing_backward_ms") or []
+    timing_optimizer = history.get("timing_optimizer_ms") or []
+    timing_dist_stats = history.get("timing_dist_stats_ms") or []
+    eval_engine = history.get("eval_engine") or []
     steps = history.get("step") or []
     summary: dict[str, Any] = {"points": len(steps)}
     if steps:
@@ -486,6 +582,42 @@ def _history_summary(history: dict[str, Any]) -> dict[str, Any]:
     if incubation_cells:
         summary["incubation_archive_cells_last"] = incubation_cells[-1]
         summary["incubation_archive_cells_max"] = max(incubation_cells)
+    if search_used:
+        summary["search_plugin_used_last"] = search_used[-1]
+        tail = search_used[-50:]
+        if tail:
+            summary["search_plugin_used_tail50_min"] = min(tail)
+            summary["search_plugin_used_tail50_max"] = max(tail)
+            summary["search_plugin_used_tail50_mean"] = sum(tail) / len(tail)
+    if search_modules:
+        summary["search_plugin_modules_last"] = search_modules[-1]
+    if search_archive:
+        summary["search_archive_size_last"] = search_archive[-1]
+        summary["search_archive_size_max"] = max(search_archive)
+    if search_cells:
+        summary["search_archive_cells_last"] = search_cells[-1]
+        summary["search_archive_cells_max"] = max(search_cells)
+    if anneal_accept:
+        summary["anneal_accept_rate_last"] = anneal_accept[-1]
+    if genetic_planned:
+        summary["genetic_planned_last"] = genetic_planned[-1]
+        tail = genetic_planned[-50:]
+        if tail:
+            summary["genetic_planned_tail50_mean"] = sum(tail) / len(tail)
+    if genetic_produced:
+        summary["genetic_produced_last"] = genetic_produced[-1]
+        tail = genetic_produced[-50:]
+        if tail:
+            summary["genetic_produced_tail50_sum"] = sum(tail)
+            summary["genetic_produced_tail50_mean"] = sum(tail) / len(tail)
+            summary["genetic_produced_tail50_max"] = max(tail)
+    if genetic_parent_count:
+        summary["genetic_parent_count_last"] = genetic_parent_count[-1]
+        tail = genetic_parent_count[-50:]
+        if tail:
+            summary["genetic_parent_count_tail50_mean"] = sum(tail) / len(tail)
+    if genetic_parent_source:
+        summary["genetic_parent_source_last"] = genetic_parent_source[-1]
     if timing_total:
         tail = timing_total[-50:]
         summary["timing_total_ms_last"] = timing_total[-1]
@@ -502,4 +634,21 @@ def _history_summary(history: dict[str, Any]) -> dict[str, Any]:
         tail = timing_grad[-50:]
         summary["timing_grad_ms_last"] = timing_grad[-1]
         summary["timing_grad_ms_tail50_mean"] = sum(tail) / len(tail)
+    for key, values in (
+        ("timing_replay_plan_ms", timing_replay_plan),
+        ("timing_search_plugin_ms", timing_search_plugin),
+        ("timing_ab_forward_ms", timing_ab_forward),
+        ("timing_policy_sample_ms", timing_policy_sample),
+        ("timing_memory_logprob_ms", timing_memory_logprob),
+        ("timing_loss_build_ms", timing_loss_build),
+        ("timing_backward_ms", timing_backward),
+        ("timing_optimizer_ms", timing_optimizer),
+        ("timing_dist_stats_ms", timing_dist_stats),
+    ):
+        if values:
+            tail = values[-50:]
+            summary[f"{key}_last"] = values[-1]
+            summary[f"{key}_tail50_mean"] = sum(tail) / len(tail)
+    if eval_engine:
+        summary["eval_engine_last"] = eval_engine[-1]
     return summary

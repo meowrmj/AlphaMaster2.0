@@ -327,9 +327,11 @@ def stream_chat_completions(
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
+                # Only show the assistant's final answer in the product UI.
+                # Some reasoning models stream ``reasoning_content`` separately; exposing
+                # that field makes the in-app analysis show chain-of-thought instead of
+                # the final Chinese report.
                 text = delta.get("content") or ""
-                if not text:
-                    text = delta.get("reasoning_content") or ""
                 if text:
                     yield text
     except urllib.error.HTTPError as exc:
