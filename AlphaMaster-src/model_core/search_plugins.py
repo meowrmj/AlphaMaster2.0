@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
+from .elite_genetic import EliteGeneticEmitter
 from .replay_policies import ReplayEntry, formula_bucket_key
 from .vocab import FORMULA_VOCAB
 
@@ -35,6 +36,7 @@ class SearchBatch:
 class SearchPluginManager:
     def __init__(self, sampler) -> None:
         self.sampler = sampler
+        self.elite_genetic = EliteGeneticEmitter(sampler)
         self.modules = _load_search_modules()
         self.archive: list[ReplayEntry] = []
         self.counter = 0
@@ -44,12 +46,25 @@ class SearchPluginManager:
             "accepted": 0,
             "tested": 0,
         }
+        self._last_genetic_info: dict[str, Any] = {
+            "planned": 0,
+            "produced": 0,
+            "parents": 0,
+            "parent_source": "none",
+        }
 
     @property
     def active(self) -> bool:
         return any(self.modules.values())
 
-    def plan(self, *, step: int, candidate_slots: int, best_formula: list[int] | None) -> SearchBatch:
+    def plan(
+        self,
+        *,
+        step: int,
+        candidate_slots: int,
+        best_formula: list[int] | None,
+        elite_pool: list[ReplayEntry] | None = None,
+    ) -> SearchBatch:
         if candidate_slots <= 0 or not self.active:
             return SearchBatch([], [], self.metrics())
         frac = max(0.0, min(0.6, float(getattr(ModelConfig, "SEARCH_PLUGIN_FRAC", 0.20))))
@@ -69,7 +84,7 @@ class SearchPluginManager:
             if name == "annealing":
                 batch = self._propose_annealing(step, k, best_formula)
             elif name == "genetic":
-                batch = self._propose_genetic(step, k, best_formula)
+                batch = self._propose_genetic(step, k, best_formula, elite_pool or [])
             else:
                 batch = []
             formulas.extend(batch)
@@ -100,6 +115,10 @@ class SearchPluginManager:
             "search_archive_size": len(self.archive),
             "search_archive_cells": len({formula_bucket_key(toks) for _sc, _cnt, toks, _birth in self.archive}),
             "anneal_accept_rate": self._anneal_accept_rate(),
+            "genetic_planned": int(self._last_genetic_info.get("planned") or 0),
+            "genetic_produced": int(self._last_genetic_info.get("produced") or 0),
+            "genetic_parent_count": int(self._last_genetic_info.get("parents") or 0),
+            "genetic_parent_source": str(self._last_genetic_info.get("parent_source") or "none"),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -147,16 +166,22 @@ class SearchPluginManager:
             self.anneal_state["current_score"] = float(score)
             self.anneal_state["accepted"] = int(self.anneal_state.get("accepted") or 0) + 1
 
-    def _propose_genetic(self, step: int, k: int, best_formula: list[int] | None) -> list[list[int]]:
-        out: list[list[int]] = []
-        for _ in range(k):
-            p1 = self._select_parent(best_formula)
-            p2 = self._select_parent(best_formula)
-            child = self._crossover(p1, p2, step) if p1 and p2 and random.random() < 0.65 else list(p1 or [])
-            if not child or random.random() < float(getattr(ModelConfig, "GA_MUTATION_RATE", 0.45)):
-                child = self._mutate_formula(child or p1 or self._random_formula(), step)
-            out.append(child)
-        return out
+    def _propose_genetic(
+        self,
+        step: int,
+        k: int,
+        best_formula: list[int] | None,
+        elite_pool: list[ReplayEntry],
+    ) -> list[list[int]]:
+        parent_pool = elite_pool if len(elite_pool) >= 2 else self.archive
+        formulas, info = self.elite_genetic.propose(step=step, k=k, elite_pool=parent_pool)
+        if formulas:
+            self._last_genetic_info = info | {
+                "parent_source": "elite_pool" if len(elite_pool) >= 2 else "search_archive",
+            }
+            return formulas
+        self._last_genetic_info = info | {"parent_source": "none"}
+        return []
 
     def _add_archive(self, score: float, formula: list[int], step: int) -> None:
         entry = (float(score), self.counter, [int(t) for t in formula], int(step))

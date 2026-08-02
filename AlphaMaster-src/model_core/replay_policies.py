@@ -81,6 +81,9 @@ class ReplayPolicy:
             "incubation_archive_cells": 0,
         }
 
+    def elite_entries(self) -> list[ReplayEntry]:
+        return []
+
 
 class QDIncubationReplayPolicy(ReplayPolicy):
     name = "qd_incubation"
@@ -100,6 +103,9 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         self.elite_counter = 0
         self.incubation_pool: list[ReplayEntry] = []
         self.incubation_counter = 0
+
+    def elite_entries(self) -> list[ReplayEntry]:
+        return [(float(sc), int(cnt), list(toks), int(birth)) for sc, cnt, toks, birth in self.elite_pool]
 
     @staticmethod
     def _rebalance_elite_pool(pool: list[ReplayEntry]) -> list[ReplayEntry]:

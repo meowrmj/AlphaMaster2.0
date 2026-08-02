@@ -1215,6 +1215,7 @@ class AlphaEngine:
                 step=step,
                 candidate_slots=n_new,
                 best_formula=self.best_formula,
+                elite_pool=self.replay_policy.elite_entries(),
             )
             timing_search_plugin_ms = (time.perf_counter() - timing_search0) * 1000.0
             plugin_formulas = search_batch.formulas
@@ -1725,6 +1726,14 @@ class AlphaEngine:
                 search_metrics["search_archive_cells"])
             self.training_history.setdefault('anneal_accept_rate', []).append(
                 search_metrics["anneal_accept_rate"])
+            self.training_history.setdefault('genetic_planned', []).append(
+                search_metrics.get("genetic_planned", 0))
+            self.training_history.setdefault('genetic_produced', []).append(
+                search_metrics.get("genetic_produced", 0))
+            self.training_history.setdefault('genetic_parent_count', []).append(
+                search_metrics.get("genetic_parent_count", 0))
+            self.training_history.setdefault('genetic_parent_source', []).append(
+                search_metrics.get("genetic_parent_source", "none"))
             self.training_history.setdefault('incubation_pool_size', []).append(
                 replay_metrics["incubation_pool_size"])
             self.training_history.setdefault('incubation_archive_cells', []).append(
