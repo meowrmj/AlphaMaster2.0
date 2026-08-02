@@ -17,6 +17,14 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
+from .behavior_dedup import (
+    dedupe_entries_by_behavior,
+    formula_key,
+    load_behavior_map,
+    normalize_behavior,
+    prune_behavior_map,
+    serialize_behavior_map,
+)
 from .elite_genetic import EliteGeneticEmitter
 from .formula_diversity import formula_core_signature, formula_start_token
 from .replay_policies import ReplayEntry, formula_bucket_key
@@ -53,6 +61,7 @@ class SearchPluginManager:
             "parents": 0,
             "parent_source": "none",
         }
+        self.behavior_by_formula: dict[tuple[int, ...], list[float]] = {}
 
     @property
     def active(self) -> bool:
@@ -106,12 +115,14 @@ class SearchPluginManager:
                 formula = [int(t) for t in (r.get("fml") or [])]
             if not formula:
                 continue
+            self._remember_behavior(formula, r.get("behavior"))
             archive_entries.append((float(score), self.counter, [int(t) for t in formula], int(step)))
             self.counter += 1
             if origin == "annealing":
                 self._observe_annealing(score, formula)
         if archive_entries:
-            self.archive = _rebalance_archive(self.archive + archive_entries)
+            self.archive = self._rebalance_with_behavior(self.archive + archive_entries)
+            self._prune_behavior_memory()
 
     def metrics(self) -> dict[str, Any]:
         names = [name for name, enabled in self.modules.items() if enabled]
@@ -125,6 +136,7 @@ class SearchPluginManager:
             "genetic_parent_count": int(self._last_genetic_info.get("parents") or 0),
             "genetic_parent_niches": int(self._last_genetic_info.get("parent_niches") or 0),
             "genetic_parent_source": str(self._last_genetic_info.get("parent_source") or "none"),
+            "search_behavior_memory_size": len(self.behavior_by_formula),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -133,6 +145,7 @@ class SearchPluginManager:
             "archive": self.archive,
             "counter": self.counter,
             "anneal_state": self.anneal_state,
+            "behavior_by_formula": serialize_behavior_map(self.behavior_by_formula),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -141,11 +154,13 @@ class SearchPluginManager:
         mods = state.get("modules")
         if isinstance(mods, dict):
             self.modules = {key: bool(mods.get(key, False)) for key in _KNOWN_MODULES}
+        self.behavior_by_formula = load_behavior_map(state.get("behavior_by_formula"))
         self.archive = _rebalance_archive(state.get("archive") or [])
         self.counter = int(state.get("counter") or 0)
         anneal = state.get("anneal_state")
         if isinstance(anneal, dict):
             self.anneal_state.update(anneal)
+        self._prune_behavior_memory()
 
     def _propose_annealing(self, step: int, k: int, best_formula: list[int] | None) -> list[list[int]]:
         seed = self.anneal_state.get("current_formula") or self._archive_seed(best_formula)
@@ -192,7 +207,25 @@ class SearchPluginManager:
     def _add_archive(self, score: float, formula: list[int], step: int) -> None:
         entry = (float(score), self.counter, [int(t) for t in formula], int(step))
         self.counter += 1
-        self.archive = _rebalance_archive(self.archive + [entry])
+        self.archive = self._rebalance_with_behavior(self.archive + [entry])
+        self._prune_behavior_memory()
+
+    def _remember_behavior(self, formula: list[int], behavior: Any) -> None:
+        vec = normalize_behavior(behavior)
+        if vec:
+            self.behavior_by_formula[formula_key(formula)] = vec
+
+    def _rebalance_with_behavior(self, pool: list[ReplayEntry]) -> list[ReplayEntry]:
+        if bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+            pool = dedupe_entries_by_behavior(
+                pool,
+                self.behavior_by_formula,
+                float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+            )
+        return _rebalance_archive(pool)
+
+    def _prune_behavior_memory(self) -> None:
+        self.behavior_by_formula = prune_behavior_map(self.behavior_by_formula, [self.archive])
 
     def _archive_seed(self, best_formula: list[int] | None) -> list[int] | None:
         if self.archive and random.random() < 0.85:

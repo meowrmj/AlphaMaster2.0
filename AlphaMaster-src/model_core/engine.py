@@ -34,6 +34,7 @@ from .backtest import MT5Backtest, estimate_periods_per_year
 from .vocab import FORMULA_VOCAB, VOCAB_VERSION, VocabVersionMismatchError  # task 12.2
 from .replay_policies import build_replay_policy, formula_bucket_key
 from .search_plugins import SearchPluginManager
+from .behavior_dedup import behavior_vector_from_factor, behavior_vectors_from_factors
 from .training_control import acknowledge_checkpoint_stop, read_checkpoint_stop_request
 
 # P3：冠军在场时间稳健性校验所需
@@ -529,13 +530,20 @@ class AlphaEngine:
                 _corr_slice = (0, max(int(res.shape[1] * 0.8), res.shape[1] - 100))
             reward = self._apply_corr_penalty(reward, res, _corr_slice)
             val_score_out = self._apply_corr_penalty(val_score_out, res, _corr_slice)
+            behavior = None
+            if bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+                behavior = behavior_vector_from_factor(
+                    res,
+                    _corr_slice,
+                    int(getattr(ModelConfig, "BEHAVIOR_VECTOR_SIZE", 512)),
+                ).detach().cpu().tolist()
 
             return {
                 'idx': idx, 'status': 'ok',
                 'reward': reward.item() if isinstance(reward, torch.Tensor) else float(reward),
                 'val_score': val_score_out.item() if isinstance(val_score_out, torch.Tensor) else float(val_score_out),
                 'ic_full': ic_full.item(), 'ic_stab': ic_stab_full.item(),
-                'ic_i': ic_i, 'res': res, 'fml': fml,
+                'ic_i': ic_i, 'res': res, 'fml': fml, 'behavior': behavior,
             }
         except Exception as e:
             return {'idx': idx, 'status': 'error', 'reward': -5.0,
@@ -643,6 +651,13 @@ class AlphaEngine:
 
             corr_slice = (folds[0]["train_start"], folds[0]["train_end"])
             corr_penalty_cpu = self._corr_penalty_mask_batch(factors, corr_slice).detach().cpu().tolist()
+            behavior_cpu = None
+            if bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+                behavior_cpu = behavior_vectors_from_factors(
+                    factors,
+                    corr_slice,
+                    int(getattr(ModelConfig, "BEHAVIOR_VECTOR_SIZE", 512)),
+                ).detach().cpu().tolist()
             results: list[dict] = []
             for i, fml in enumerate(formulas):
                 if not valid_cpu[i]:
@@ -673,6 +688,7 @@ class AlphaEngine:
                     'val_score': val_score_out.item() if isinstance(val_score_out, torch.Tensor) else float(val_score_out),
                     'ic_full': ic_full_batch[i].item(), 'ic_stab': ic_stab_batch[i].item(),
                     'ic_i': ic_i, 'res': res, 'fml': fml,
+                    'behavior': behavior_cpu[i] if behavior_cpu is not None else None,
                 })
             return results
         except Exception:
@@ -1521,6 +1537,7 @@ class AlphaEngine:
                     "score": final_val,
                     "formula": fml,
                     "is_new": i < n_policy + n_plugin,
+                    "behavior": r.get("behavior"),
                 })
 
             rewards = torch.tensor(reward_values, dtype=torch.float32, device=ModelConfig.DEVICE)

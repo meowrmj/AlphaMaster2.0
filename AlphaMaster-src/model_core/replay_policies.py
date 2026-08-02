@@ -13,6 +13,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import ModelConfig
+from .behavior_dedup import (
+    dedupe_entries_by_behavior,
+    formula_key,
+    load_behavior_map,
+    normalize_behavior,
+    prune_behavior_map,
+    serialize_behavior_map,
+)
 from .formula_diversity import formula_behavior_key, formula_core_signature, formula_start_token
 
 ReplayEntry = tuple[float, int, list[int], int]
@@ -111,6 +119,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         self.elite_counter = 0
         self.incubation_pool: list[ReplayEntry] = []
         self.incubation_counter = 0
+        self.behavior_by_formula: dict[tuple[int, ...], list[float]] = {}
 
     def elite_entries(self) -> list[ReplayEntry]:
         return [(float(sc), int(cnt), list(toks), int(birth)) for sc, cnt, toks, birth in self.elite_pool]
@@ -264,12 +273,34 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         entry = (float(score), self.elite_counter, [int(t) for t in formula], int(step))
         self.elite_counter += 1
         if self.enable_qd:
-            self.elite_pool = self._rebalance_elite_pool(self.elite_pool + [entry])
+            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + [entry], "elite", step)
         capture_steps = max(0, int(getattr(ModelConfig, "INCUBATION_CAPTURE_STEPS", 180)))
         if self.enable_incubation and is_new and step - last_restart_step < capture_steps:
             inc = (float(score), self.incubation_counter, [int(t) for t in formula], int(step))
             self.incubation_counter += 1
-            self.incubation_pool = self._rebalance_incubation_pool(self.incubation_pool + [inc], step)
+            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + [inc], "incubation", step)
+
+    def _remember_behavior(self, formula: list[int], behavior: Any) -> None:
+        vec = normalize_behavior(behavior)
+        if vec:
+            self.behavior_by_formula[formula_key(formula)] = vec
+
+    def _rebalance_with_behavior(self, pool: list[ReplayEntry], kind: str, step: int) -> list[ReplayEntry]:
+        if bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+            pool = dedupe_entries_by_behavior(
+                pool,
+                self.behavior_by_formula,
+                float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+            )
+        if kind == "incubation":
+            return self._rebalance_incubation_pool(pool, step)
+        return self._rebalance_elite_pool(pool)
+
+    def _prune_behavior_memory(self) -> None:
+        self.behavior_by_formula = prune_behavior_map(
+            self.behavior_by_formula,
+            [self.elite_pool, self.incubation_pool],
+        )
 
     def observe_many(self, items: list[dict[str, Any]], *, step: int, last_restart_step: int) -> None:
         if not items:
@@ -282,6 +313,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             formula = [int(t) for t in (item.get("formula") or [])]
             if not formula:
                 continue
+            self._remember_behavior(formula, item.get("behavior"))
             score = float(item.get("score", 0.0))
             if self.enable_qd:
                 elite_entries.append((score, self.elite_counter, formula, int(step)))
@@ -290,9 +322,10 @@ class QDIncubationReplayPolicy(ReplayPolicy):
                 incubation_entries.append((score, self.incubation_counter, formula, int(step)))
                 self.incubation_counter += 1
         if elite_entries:
-            self.elite_pool = self._rebalance_elite_pool(self.elite_pool + elite_entries)
+            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + elite_entries, "elite", step)
         if incubation_entries:
-            self.incubation_pool = self._rebalance_incubation_pool(self.incubation_pool + incubation_entries, step)
+            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + incubation_entries, "incubation", step)
+        self._prune_behavior_memory()
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -303,6 +336,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             "elite_counter": self.elite_counter,
             "incubation_pool": self.incubation_pool,
             "incubation_counter": self.incubation_counter,
+            "behavior_by_formula": serialize_behavior_map(self.behavior_by_formula),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -323,12 +357,14 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             self.name = "incubation"
         else:
             self.name = "none"
+        self.behavior_by_formula = load_behavior_map(state.get("behavior_by_formula"))
         self.elite_pool = self._rebalance_elite_pool(state.get("elite_pool") or []) if self.enable_qd else []
         self.elite_counter = int(state.get("elite_counter") or 0)
         incubation = state.get("incubation_pool") or []
         restore_step = max((int(entry[3]) for entry in incubation), default=0)
         self.incubation_pool = self._rebalance_incubation_pool(incubation, restore_step) if self.enable_incubation else []
         self.incubation_counter = int(state.get("incubation_counter") or 0)
+        self._prune_behavior_memory()
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -336,6 +372,7 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             "elite_archive_cells": len({formula_bucket_key(toks) for _sc, _cnt, toks, _birth in self.elite_pool}),
             "incubation_pool_size": len(self.incubation_pool),
             "incubation_archive_cells": len({formula_bucket_key(toks) for _sc, _cnt, toks, _birth in self.incubation_pool}),
+            "behavior_memory_size": len(self.behavior_by_formula),
         }
 
 
