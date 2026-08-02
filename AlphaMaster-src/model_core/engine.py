@@ -1410,13 +1410,14 @@ class AlphaEngine:
             all_fmls = seqs_new_list + plugin_formulas + memory_formulas
             formula_origins = (["policy"] * len(seqs_new_list)) + plugin_origins + (["memory"] * len(memory_formulas))
             tot      = len(all_fmls)
-            rewards    = torch.zeros(tot, device=ModelConfig.DEVICE)
-            val_scores = torch.zeros(tot, device=ModelConfig.DEVICE)
 
             ok_cnt = none_cnt = const_cnt = 0
             step_max_val = -float('inf');  step_best_f = None
             new_step_max_val = -float('inf');  new_step_best_f = None
             bic, bis, bsor = [], [], []
+            reward_values = [0.0] * tot
+            val_score_values = [0.0] * tot
+            replay_observations: list[dict[str, Any]] = []
 
             # factor_pool 快照：所有 worker 看到同一份只读视图
             factor_pool_snapshot = list(self.factor_pool)
@@ -1455,8 +1456,8 @@ class AlphaEngine:
             for r in results:
                 i = r['idx']
                 status = r.get('status', 'error')
-                rewards[i] = r['reward']
-                val_scores[i] = r['val_score']
+                reward_values[i] = float(r['reward'])
+                val_score_values[i] = float(r['val_score'])
 
                 if status == 'none':
                     none_cnt += 1
@@ -1516,13 +1517,19 @@ class AlphaEngine:
                                 f"IC={ic_i:.4f} 暴露度={exposure:.1%} | "
                                 f"{fml}\n    {self._decode_formula(fml)}"
                             )
-                self.replay_policy.observe(
-                    score=final_val,
-                    formula=fml,
-                    step=step,
-                    is_new=i < n_policy + n_plugin,
-                    last_restart_step=self._last_restart_step,
-                )
+                replay_observations.append({
+                    "score": final_val,
+                    "formula": fml,
+                    "is_new": i < n_policy + n_plugin,
+                })
+
+            rewards = torch.tensor(reward_values, dtype=torch.float32, device=ModelConfig.DEVICE)
+            val_scores = torch.tensor(val_score_values, dtype=torch.float32, device=ModelConfig.DEVICE)
+            self.replay_policy.observe_many(
+                replay_observations,
+                step=step,
+                last_restart_step=self._last_restart_step,
+            )
 
             plugin_results = [
                 results[i] for i, origin in enumerate(formula_origins)

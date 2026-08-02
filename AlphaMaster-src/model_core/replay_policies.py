@@ -55,6 +55,16 @@ class ReplayPolicy:
     def observe(self, *, score: float, formula: list[int], step: int, is_new: bool, last_restart_step: int) -> None:
         return
 
+    def observe_many(self, items: list[dict[str, Any]], *, step: int, last_restart_step: int) -> None:
+        for item in items:
+            self.observe(
+                score=float(item.get("score", 0.0)),
+                formula=[int(t) for t in (item.get("formula") or [])],
+                step=step,
+                is_new=bool(item.get("is_new", False)),
+                last_restart_step=last_restart_step,
+            )
+
     def state_dict(self) -> dict[str, Any]:
         return {"name": self.name}
 
@@ -246,6 +256,29 @@ class QDIncubationReplayPolicy(ReplayPolicy):
             inc = (float(score), self.incubation_counter, [int(t) for t in formula], int(step))
             self.incubation_counter += 1
             self.incubation_pool = self._rebalance_incubation_pool(self.incubation_pool + [inc], step)
+
+    def observe_many(self, items: list[dict[str, Any]], *, step: int, last_restart_step: int) -> None:
+        if not items:
+            return
+        elite_entries: list[ReplayEntry] = []
+        incubation_entries: list[ReplayEntry] = []
+        capture_steps = max(0, int(getattr(ModelConfig, "INCUBATION_CAPTURE_STEPS", 180)))
+        capture_incubation = self.enable_incubation and step - last_restart_step < capture_steps
+        for item in items:
+            formula = [int(t) for t in (item.get("formula") or [])]
+            if not formula:
+                continue
+            score = float(item.get("score", 0.0))
+            if self.enable_qd:
+                elite_entries.append((score, self.elite_counter, formula, int(step)))
+            self.elite_counter += 1
+            if capture_incubation and bool(item.get("is_new", False)):
+                incubation_entries.append((score, self.incubation_counter, formula, int(step)))
+                self.incubation_counter += 1
+        if elite_entries:
+            self.elite_pool = self._rebalance_elite_pool(self.elite_pool + elite_entries)
+        if incubation_entries:
+            self.incubation_pool = self._rebalance_incubation_pool(self.incubation_pool + incubation_entries, step)
 
     def state_dict(self) -> dict[str, Any]:
         return {

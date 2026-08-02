@@ -93,6 +93,7 @@ class SearchPluginManager:
         return SearchBatch(formulas, origins, self.metrics() | {"planned": len(formulas)})
 
     def observe(self, *, step: int, results: list[dict], origins: list[str]) -> None:
+        archive_entries: list[ReplayEntry] = []
         for r, origin in zip(results, origins):
             if not origin:
                 continue
@@ -105,9 +106,12 @@ class SearchPluginManager:
                 formula = [int(t) for t in (r.get("fml") or [])]
             if not formula:
                 continue
-            self._add_archive(score, formula, step)
+            archive_entries.append((float(score), self.counter, [int(t) for t in formula], int(step)))
+            self.counter += 1
             if origin == "annealing":
                 self._observe_annealing(score, formula)
+        if archive_entries:
+            self.archive = _rebalance_archive(self.archive + archive_entries)
 
     def metrics(self) -> dict[str, Any]:
         names = [name for name, enabled in self.modules.items() if enabled]
