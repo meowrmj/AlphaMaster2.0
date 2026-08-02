@@ -939,11 +939,12 @@ const CHART_OPTIONS = {
   maintainAspectRatio: false,
   normalized: true,
   interaction: { mode: "index", intersect: false },
-  events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : [],
+  events: chartTooltipPersistent ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"] : ["click"],
   animation: { duration: 450, easing: "easeOutQuart" },
   transitions: {
-    active: { animation: { duration: 450, easing: "easeOutQuart" } },
+    active: { animation: { duration: 0 } },
   },
+  hover: { animationDuration: 0 },
   plugins: {
     legend: {
       labels: {
@@ -957,6 +958,7 @@ const CHART_OPTIONS = {
       },
     },
     tooltip: {
+      enabled: chartTooltipPersistent,
       backgroundColor: "rgba(8, 12, 20, 0.92)",
       borderColor: "rgba(94, 234, 212, 0.35)",
       borderWidth: 1,
@@ -1146,7 +1148,8 @@ function updateChartTooltipMode() {
   if (!chart) return;
   chart.options.events = chartTooltipPersistent
     ? ["mousemove", "mouseout", "click", "touchstart", "touchmove"]
-    : [];
+    : ["click"];
+  chart.options.plugins.tooltip.enabled = chartTooltipPersistent;
   if (!chartTooltipPersistent) {
     chart.setActiveElements([]);
     chart.tooltip?.setActiveElements([], { x: 0, y: 0 });

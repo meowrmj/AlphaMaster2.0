@@ -15,6 +15,7 @@ from typing import Any
 from .config import ModelConfig
 from .behavior_dedup import (
     dedupe_entries_by_behavior,
+    filter_new_entries_by_behavior,
     formula_key,
     load_behavior_map,
     normalize_behavior,
@@ -273,12 +274,14 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         entry = (float(score), self.elite_counter, [int(t) for t in formula], int(step))
         self.elite_counter += 1
         if self.enable_qd:
-            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + [entry], "elite", step)
+            accepted = self._filter_new_by_behavior(self.elite_pool, [entry])
+            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + accepted, "elite", step)
         capture_steps = max(0, int(getattr(ModelConfig, "INCUBATION_CAPTURE_STEPS", 180)))
         if self.enable_incubation and is_new and step - last_restart_step < capture_steps:
             inc = (float(score), self.incubation_counter, [int(t) for t in formula], int(step))
             self.incubation_counter += 1
-            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + [inc], "incubation", step)
+            accepted = self._filter_new_by_behavior(self.incubation_pool, [inc])
+            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + accepted, "incubation", step)
 
     def _remember_behavior(self, formula: list[int], behavior: Any) -> None:
         vec = normalize_behavior(behavior)
@@ -296,6 +299,21 @@ class QDIncubationReplayPolicy(ReplayPolicy):
         if kind == "incubation":
             return self._rebalance_incubation_pool(pool, step)
         return self._rebalance_elite_pool(pool)
+
+    def _filter_new_by_behavior(
+        self,
+        existing: list[ReplayEntry],
+        candidates: list[ReplayEntry],
+    ) -> list[ReplayEntry]:
+        if not bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+            return candidates
+        return filter_new_entries_by_behavior(
+            existing,
+            candidates,
+            self.behavior_by_formula,
+            float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+            float(getattr(ModelConfig, "BEHAVIOR_CORE_CORR_THRESHOLD", 0.93)),
+        )
 
     def _prune_behavior_memory(self) -> None:
         self.behavior_by_formula = prune_behavior_map(
@@ -323,9 +341,11 @@ class QDIncubationReplayPolicy(ReplayPolicy):
                 incubation_entries.append((score, self.incubation_counter, formula, int(step)))
                 self.incubation_counter += 1
         if elite_entries:
-            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + elite_entries, "elite", step)
+            accepted = self._filter_new_by_behavior(self.elite_pool, elite_entries)
+            self.elite_pool = self._rebalance_with_behavior(self.elite_pool + accepted, "elite", step)
         if incubation_entries:
-            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + incubation_entries, "incubation", step)
+            accepted = self._filter_new_by_behavior(self.incubation_pool, incubation_entries)
+            self.incubation_pool = self._rebalance_with_behavior(self.incubation_pool + accepted, "incubation", step)
         self._prune_behavior_memory()
 
     def state_dict(self) -> dict[str, Any]:

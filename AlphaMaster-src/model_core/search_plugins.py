@@ -19,6 +19,7 @@ import torch
 from .config import ModelConfig
 from .behavior_dedup import (
     dedupe_entries_by_behavior,
+    filter_new_entries_by_behavior,
     formula_key,
     load_behavior_map,
     normalize_behavior,
@@ -122,7 +123,8 @@ class SearchPluginManager:
             if origin == "annealing":
                 self._observe_annealing(score, formula)
         if archive_entries:
-            self.archive = self._rebalance_with_behavior(self.archive + archive_entries)
+            accepted = self._filter_new_by_behavior(archive_entries)
+            self.archive = self._rebalance_with_behavior(self.archive + accepted)
             self._prune_behavior_memory()
 
     def metrics(self) -> dict[str, Any]:
@@ -209,7 +211,8 @@ class SearchPluginManager:
     def _add_archive(self, score: float, formula: list[int], step: int) -> None:
         entry = (float(score), self.counter, [int(t) for t in formula], int(step))
         self.counter += 1
-        self.archive = self._rebalance_with_behavior(self.archive + [entry])
+        accepted = self._filter_new_by_behavior([entry])
+        self.archive = self._rebalance_with_behavior(self.archive + accepted)
         self._prune_behavior_memory()
 
     def _remember_behavior(self, formula: list[int], behavior: Any) -> None:
@@ -226,6 +229,17 @@ class SearchPluginManager:
                 float(getattr(ModelConfig, "BEHAVIOR_CORE_CORR_THRESHOLD", 0.93)),
             )
         return _rebalance_archive(pool)
+
+    def _filter_new_by_behavior(self, candidates: list[ReplayEntry]) -> list[ReplayEntry]:
+        if not bool(getattr(ModelConfig, "BEHAVIOR_DEDUP_ENABLED", True)):
+            return candidates
+        return filter_new_entries_by_behavior(
+            self.archive,
+            candidates,
+            self.behavior_by_formula,
+            float(getattr(ModelConfig, "BEHAVIOR_CORR_THRESHOLD", 0.975)),
+            float(getattr(ModelConfig, "BEHAVIOR_CORE_CORR_THRESHOLD", 0.93)),
+        )
 
     def _prune_behavior_memory(self) -> None:
         self.behavior_by_formula = prune_behavior_map(self.behavior_by_formula, [self.archive])
