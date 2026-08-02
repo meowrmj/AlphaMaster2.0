@@ -1,4 +1,5 @@
 const API = "";
+const DEFAULT_CHART_WINDOW = 360;
 let selectedDataFile = null;
 let selectedSymbol = null;
 let dataRootDir = "";
@@ -18,6 +19,7 @@ let chartZoom = { min: null, max: null };
 let chartDrag = null;
 let chartAutoFollow = true;
 let chartZoomHandlersReady = false;
+let chartFollowSpan = DEFAULT_CHART_WINDOW - 1;
 let trainingStartPending = false;
 let trainingPendingAction = null;
 let trainingRequestInFlight = false;
@@ -42,7 +44,6 @@ let lastErrorPopupText = "";
 let lastErrorPopupAt = 0;
 
 const $ = (id) => document.getElementById(id);
-const DEFAULT_CHART_WINDOW = 360;
 const MIN_LAUNCH_PENDING_MS = 650;
 const START_BTN_IDLE_TEXT = "开始训练";
 const RETRAIN_BTN_TEXT = "重新训练";
@@ -1016,6 +1017,7 @@ function destroyChart() {
   chartSymbol = null;
   chartZoom = { min: null, max: null };
   chartAutoFollow = true;
+  chartFollowSpan = DEFAULT_CHART_WINDOW - 1;
 }
 
 function createChart(ctx, steps, history) {
@@ -1109,6 +1111,25 @@ function currentChartWindowSpan(total) {
   return Number.isFinite(span) && span > 0 ? span : Math.min(DEFAULT_CHART_WINDOW - 1, total - 1);
 }
 
+function explicitChartWindowSpan(total) {
+  if (!Number.isFinite(total) || total <= 1) return DEFAULT_CHART_WINDOW - 1;
+  const maxIndex = total - 1;
+  const min = chartZoom.min ?? 0;
+  const max = chartZoom.max ?? maxIndex;
+  const span = max - min;
+  return Number.isFinite(span) && span > 0
+    ? Math.min(span, maxIndex)
+    : Math.min(DEFAULT_CHART_WINDOW - 1, maxIndex);
+}
+
+function rememberChartFollowSpan(total) {
+  const span = explicitChartWindowSpan(total);
+  if (Number.isFinite(span) && span > 0) {
+    chartFollowSpan = span;
+  }
+  return chartFollowSpan;
+}
+
 function chartWindowTouchesLatest(total, tolerance = 2) {
   if (!Number.isFinite(total) || total <= 0) return true;
   if (chartZoom.min == null || chartZoom.max == null) return true;
@@ -1116,16 +1137,22 @@ function chartWindowTouchesLatest(total, tolerance = 2) {
 }
 
 function followLatestChartWindow(total, spanOverride = null) {
-  if (!Number.isFinite(total) || total <= DEFAULT_CHART_WINDOW) {
+  if (!Number.isFinite(total) || total <= 0) {
     chartZoom = { min: null, max: null };
     return;
   }
+  const maxIndex = total - 1;
   const span = Number.isFinite(spanOverride)
-    ? Math.max(2, Math.min(spanOverride, total - 1))
-    : currentChartWindowSpan(total);
+    ? Math.max(2, Math.min(spanOverride, maxIndex))
+    : Math.max(2, Math.min(chartFollowSpan || currentChartWindowSpan(total), maxIndex));
+  chartFollowSpan = span;
+  if (span >= maxIndex) {
+    chartZoom = { min: null, max: null };
+    return;
+  }
   chartZoom = {
-    min: Math.max(0, total - 1 - span),
-    max: total - 1,
+    min: Math.max(0, maxIndex - span),
+    max: maxIndex,
   };
 }
 
@@ -1149,9 +1176,10 @@ function zoomChartAt(canvasX, factor) {
   const nextSpan = span * factor;
   const wasFollowingLatest = chartAutoFollow || chartWindowTouchesLatest(total);
   chartZoom = clampChartWindow(center - nextSpan * ratio, center + nextSpan * (1 - ratio), total);
+  const zoomedSpan = rememberChartFollowSpan(total);
   if (wasFollowingLatest && chartWindowTouchesLatest(total)) {
     chartAutoFollow = true;
-    followLatestChartWindow(total, currentChartWindowSpan(total));
+    followLatestChartWindow(total, zoomedSpan);
   } else {
     chartAutoFollow = false;
   }
@@ -1168,6 +1196,7 @@ function panChartByPixels(deltaX) {
   const shift = -deltaX * pointsPerPixel;
   chartZoom = clampChartWindow(chartDrag.min + shift, chartDrag.max + shift, total);
   chartAutoFollow = chartWindowTouchesLatest(total);
+  if (chartAutoFollow) rememberChartFollowSpan(total);
   applyChartZoom("none");
 }
 
@@ -1207,6 +1236,7 @@ function installChartZoomHandlers() {
 
 function updateChartInPlace(steps, history) {
   const prevLen = chart.data.labels.length;
+  const followSpan = chartAutoFollow ? rememberChartFollowSpan(prevLen || steps.length) : chartFollowSpan;
   chart.data.labels = steps;
 
   const next = buildChartDatasets(history);
@@ -1223,7 +1253,7 @@ function updateChartInPlace(steps, history) {
   chart.data.datasets = chart.data.datasets.filter((d) => nextLabels.has(d.label));
 
   const grew = steps.length > prevLen;
-  if (chartAutoFollow && grew) followLatestChartWindow(steps.length, currentChartWindowSpan(prevLen || steps.length));
+  if (chartAutoFollow && grew) followLatestChartWindow(steps.length, followSpan);
   applyChartZoom(grew ? "active" : "none");
 }
 
