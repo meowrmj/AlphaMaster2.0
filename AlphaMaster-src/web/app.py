@@ -76,6 +76,15 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_static_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _project_relative_path(path: str | Path) -> str:
     p = Path(str(path)).expanduser()
     try:
